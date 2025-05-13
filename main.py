@@ -6,6 +6,7 @@ import random
 import numpy as np
 from PIL import Image
 import math
+import shutil
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -22,6 +23,7 @@ import cv2
 # Cloud Run dynamically sets the PORT environment variable.
 PORT = int(os.environ.get("PORT", 8080))
 OUTPUT_BUCKET_NAME = "n8n-bucket-yt" # Bucket to store final videos
+LOCAL_OUTPUT_DIR = "./output" # Local directory to save copies of output files
 # Configure basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -227,8 +229,13 @@ def process_video_task(request_data: VideoData):
     output_video_filename = f"output_{os.urandom(8).hex()}.mp4"
     final_video_url = None # Initialize
 
+    # Create local output directory if it doesn't exist
+    os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+    local_output_path = os.path.join(LOCAL_OUTPUT_DIR, output_video_filename)
+    
     with tempfile.TemporaryDirectory() as tmpdir:
         output_video_path = os.path.join(tmpdir, output_video_filename)
+        temp_audio_path = os.path.join(tmpdir, 'temp-audio.m4a')
         try:
             logger.info(f"Using temporary directory: {tmpdir}")
 
@@ -312,32 +319,32 @@ def process_video_task(request_data: VideoData):
 
                 # Create text clip
                 try:
+                    # Make sure to use an integer for font_size and stroke_width
                     txt_clip = TextClip(
-                        item.words,
-                        font_size=TEXT_FONT_SIZE,
+                        TEXT_FONT,  # First parameter is font
+                        text=item.words,  # Use 'text' parameter
+                        font_size=int(TEXT_FONT_SIZE),  # Convert to integer
                         color=TEXT_COLOR,
                         stroke_color=TEXT_STROKE_COLOR,
-                        stroke_width=TEXT_STROKE_WIDTH,
-                        size=(VIDEO_WIDTH * 0.9, None), # Limit width to 90% of video
-                        method='caption' # Auto-wrap text
+                        stroke_width=int(TEXT_STROKE_WIDTH),  # Convert to integer
+                        size=(int(VIDEO_WIDTH * 0.9), None),  # Convert width to integer
+                        method='caption'  # Auto-wrap text
                     )
-                    # Set font separately to avoid multiple values error
-                    txt_clip = txt_clip.with_font(TEXT_FONT)
                     
                     # Calculate position
                     pos_x, pos_y = TEXT_POSITION
                     clip_w, clip_h = txt_clip.size
                     if pos_y == 'bottom':
-                         final_pos_y = VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM
+                         final_pos_y = int(VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM)  # Convert to integer
                     elif pos_y == 'center':
-                         final_pos_y = (VIDEO_HEIGHT - clip_h) / 2
+                         final_pos_y = int((VIDEO_HEIGHT - clip_h) / 2)  # Convert to integer
                     else: # Assume top or numeric
-                         final_pos_y = pos_y
+                         final_pos_y = int(pos_y) if isinstance(pos_y, (int, float)) else pos_y
 
                     if pos_x == 'center':
-                         final_pos_x = (VIDEO_WIDTH - clip_w) / 2
+                         final_pos_x = int((VIDEO_WIDTH - clip_w) / 2)  # Convert to integer
                     else: # Assume left/right or numeric
-                        final_pos_x = pos_x
+                        final_pos_x = int(pos_x) if isinstance(pos_x, (int, float)) else pos_x
 
                     txt_clip = txt_clip.with_position((final_pos_x, final_pos_y))
                     txt_clip = txt_clip.with_start(start_time)
@@ -346,7 +353,8 @@ def process_video_task(request_data: VideoData):
                     logger.debug(f"Created text clip: '{item.words}' start={start_time:.2f} end={end_time:.2f}")
                 except Exception as e:
                     logger.error(f"Error creating text clip for '{item.words}': {e}")
-                    # Decide whether to fail or continue without this text
+                    # Continue without this text clip rather than failing the entire process
+                    continue
 
             # --- Combine Audio --- #
             logger.info("Combining audio tracks...")
@@ -371,7 +379,7 @@ def process_video_task(request_data: VideoData):
                 output_video_path,
                 codec='libx264',
                 audio_codec='aac',
-                temp_audiofile=os.path.join(tmpdir, 'temp-audio.m4a'), # Ensure temp file is in tmpdir
+                temp_audiofile=temp_audio_path, # Ensure temp file is in tmpdir
                 remove_temp=True,
                 fps=24,
                 preset='medium', # 'medium' is a balance, 'fast' or 'ultrafast' for speed
@@ -379,6 +387,23 @@ def process_video_task(request_data: VideoData):
                 logger='bar' # or None to disable progress bar logging
             )
             logger.info("Video file written successfully.")
+            
+            # Copy files to local output directory for development
+            logger.info(f"Copying output video to local directory: {local_output_path}")
+            shutil.copy2(output_video_path, local_output_path)
+            
+            # Copy the audio file if it exists
+            if os.path.exists(voice_path):
+                voice_audio_filename = os.path.basename(voice_path)
+                local_voice_path = os.path.join(LOCAL_OUTPUT_DIR, voice_audio_filename)
+                shutil.copy2(voice_path, local_voice_path)
+                logger.info(f"Copied voice audio to: {local_voice_path}")
+            
+            if os.path.exists(bg_music_path):
+                bg_music_filename = os.path.basename(bg_music_path)
+                local_bg_music_path = os.path.join(LOCAL_OUTPUT_DIR, bg_music_filename)
+                shutil.copy2(bg_music_path, local_bg_music_path)
+                logger.info(f"Copied background music to: {local_bg_music_path}")
 
             # 5. Upload Result
             logger.info(f"Uploading result: {output_video_path}")
