@@ -255,7 +255,7 @@ def process_video_task(request_data: VideoData):
                 
                 # Adjust background music duration first
                 if bg_music.duration > voice_audio.duration:
-                    bg_music = bg_music.subclip(0, voice_audio.duration)
+                    bg_music = bg_music.subclipped(0, voice_audio.duration)
                 elif bg_music.duration < voice_audio.duration:
                     # Loop background music if shorter than video
                     bg_music = bg_music.loop(duration=voice_audio.duration)
@@ -265,7 +265,7 @@ def process_video_task(request_data: VideoData):
                 logger.info(f"Voice audio duration: {video_duration:.2f} seconds")
                 
                 # Apply volume adjustment directly to the audio array
-                bg_music = bg_music.volumex(BG_MUSIC_VOLUME)
+                bg_music = bg_music.with_effects([MultiplyVolume(BG_MUSIC_VOLUME)])
             except Exception as e:
                 logging.error(f"Error loading audio file: {e}")
                 raise
@@ -314,7 +314,7 @@ def process_video_task(request_data: VideoData):
                 try:
                     txt_clip = TextClip(
                         item.words,
-                        fontsize=TEXT_FONT_SIZE,
+                        font_size=TEXT_FONT_SIZE,
                         color=TEXT_COLOR,
                         stroke_color=TEXT_STROKE_COLOR,
                         stroke_width=TEXT_STROKE_WIDTH,
