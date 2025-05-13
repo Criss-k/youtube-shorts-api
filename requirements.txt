@@ -1,0 +1,7 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0.0
+requests
+google-cloud-storage
+moviepy>=2.1.2
+opencv-python>=4.8.0

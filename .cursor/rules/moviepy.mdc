@@ -1,0 +1,11 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+#### Using moviepy 
+- version 2.1.2
+- Correct import statement: from moviepy import ImageClip, AudioFileClip ... 
+- Do NOT use `from moviepy.audio.fx.all import volumex` for volume adjustment it is not available in this version. Use `from moviepy.audio.fx import MultiplyVolume` instead
+
+
