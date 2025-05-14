@@ -302,6 +302,153 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             blank = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
             return ImageClip(blank, duration=duration)
 
+def create_text_clip(text, start_time, end_time):
+    """
+    Creates a text clip with shadow effect.
+    
+    Args:
+        text (str): The text to display
+        start_time (float): Start time in seconds
+        end_time (float): End time in seconds
+        
+    Returns:
+        list: List of clips (shadow and main text)
+    """
+    text_duration = end_time - start_time
+    if text_duration <= 0:
+        logger.warning(f"Skipping text clip with zero/negative duration: '{text}'")
+        return []
+
+    clips = []
+    try:
+        # Main text clip with transparent background
+        txt_clip = TextClip(
+            TEXT_FONT,  # Font path
+            text=text,
+            font_size=int(TEXT_FONT_SIZE),
+            color=TEXT_COLOR,
+            stroke_color=TEXT_STROKE_COLOR,
+            stroke_width=int(TEXT_STROKE_WIDTH),
+            size=(int(VIDEO_WIDTH * 0.9), None),
+            method='caption',  # Auto-wrap text
+            transparent=True  # Ensure transparency
+        )
+        
+        # Create shadow clip with transparent background
+        shadow_clip = TextClip(
+            TEXT_FONT,
+            text=text,
+            font_size=int(TEXT_FONT_SIZE),
+            color=TEXT_SHADOW_COLOR,
+            size=(int(VIDEO_WIDTH * 0.9), None),
+            method='caption',
+            transparent=True
+        )
+        
+        # Calculate position
+        pos_x, pos_y = TEXT_POSITION
+        clip_w, clip_h = txt_clip.size
+        if pos_y == 'bottom':
+             final_pos_y = int(VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM)
+        elif pos_y == 'center':
+             final_pos_y = int((VIDEO_HEIGHT - clip_h) / 2)
+        else: # Assume top or numeric
+             final_pos_y = int(pos_y) if isinstance(pos_y, (int, float)) else pos_y
+
+        if pos_x == 'center':
+             final_pos_x = int((VIDEO_WIDTH - clip_w) / 2)
+        else: # Assume left/right or numeric
+            final_pos_x = int(pos_x) if isinstance(pos_x, (int, float)) else pos_x
+
+        # Position shadow with offset
+        shadow_pos_x = final_pos_x + TEXT_SHADOW_OFFSET[0]
+        shadow_pos_y = final_pos_y + TEXT_SHADOW_OFFSET[1]
+        
+        # Apply blur to shadow if needed
+        if TEXT_SHADOW_BLUR > 0:
+            try:
+                # Get the shadow text as a numpy array
+                shadow_array = shadow_clip.get_frame(0)
+                
+                # Apply a gaussian blur
+                shadow_array = cv2.GaussianBlur(shadow_array, 
+                                            (TEXT_SHADOW_BLUR*2+1, TEXT_SHADOW_BLUR*2+1), 
+                                            TEXT_SHADOW_BLUR)
+                
+                # Create a new clip from the blurred array
+                shadow_clip = ImageClip(shadow_array).with_duration(text_duration)
+            except Exception as blur_error:
+                logger.warning(f"Could not apply blur to shadow: {blur_error}")
+                # Continue without blur effect
+        
+        # Set shadow position
+        shadow_clip = shadow_clip.with_position((shadow_pos_x, shadow_pos_y))
+        shadow_clip = shadow_clip.with_start(start_time)
+        shadow_clip = shadow_clip.with_duration(text_duration)
+        
+        # Set text position
+        txt_clip = txt_clip.with_position((final_pos_x, final_pos_y))
+        txt_clip = txt_clip.with_start(start_time)
+        txt_clip = txt_clip.with_duration(text_duration)
+        
+        # Add both clips
+        clips.append(shadow_clip)
+        clips.append(txt_clip)
+        
+        logger.debug(f"Created text clip with shadow: '{text}' start={start_time:.2f} end={end_time:.2f}")
+    except Exception as e:
+        logger.error(f"Error creating text clip for '{text}': {e}")
+        # Continue without this text clip rather than failing the entire process
+    
+    return clips
+
+def process_audio(voice_path, bg_music_path, target_duration=None):
+    """
+    Process audio files by loading, adjusting, and combining them.
+    
+    Args:
+        voice_path (str): Path to voice/narration audio file
+        bg_music_path (str): Path to background music file
+        target_duration (float, optional): Target duration to limit audio
+        
+    Returns:
+        tuple: (final_composite_audio, actual_duration)
+    """
+    try:
+        # Load voice audio
+        voice_audio = AudioFileClip(voice_path)
+        
+        # Subclip if target duration specified
+        if target_duration is not None:
+            voice_audio = voice_audio.subclipped(0, target_duration)
+            
+        # Get actual duration (might be less than target if audio is shorter)
+        actual_duration = voice_audio.duration
+        logger.info(f"Voice audio duration: {actual_duration:.2f} seconds")
+        
+        # Load background music
+        bg_music = AudioFileClip(bg_music_path)
+        
+        # Adjust background music duration
+        if bg_music.duration > actual_duration:
+            bg_music = bg_music.subclipped(0, actual_duration)
+        elif bg_music.duration < actual_duration:
+            # Loop background music if shorter than video
+            bg_music = bg_music.loop(duration=actual_duration)
+        
+        # Apply volume adjustment to background music
+        bg_music = bg_music.with_effects([MultiplyVolume(BG_MUSIC_VOLUME)])
+        
+        # Combine audio tracks
+        final_audio = CompositeAudioClip([voice_audio, bg_music])
+        
+        # Ensure final audio has the exact duration
+        final_audio = final_audio.with_duration(actual_duration)
+        
+        return final_audio, actual_duration
+    except Exception as e:
+        logger.error(f"Error processing audio: {e}")
+        raise
 
 def process_video_task(request_data: VideoData):
     """
@@ -335,212 +482,32 @@ def process_video_task(request_data: VideoData):
             if not image_paths:
                 raise ValueError("No image URLs provided or failed to download images.")
 
-            # 2. Load Audio
-            logging.info("Loading audio files...")
+            # 2. Process Audio
+            logging.info("Processing audio...")
             try:
-                voice_audio = AudioFileClip(voice_path)
-                # Load background music
-                bg_music = AudioFileClip(bg_music_path)
-                
-                # Adjust background music duration first
-                if bg_music.duration > voice_audio.duration:
-                    bg_music = bg_music.subclipped(0, voice_audio.duration)
-                elif bg_music.duration < voice_audio.duration:
-                    # Loop background music if shorter than video
-                    bg_music = bg_music.loop(duration=voice_audio.duration)
-                
-                # Store final duration
-                video_duration = voice_audio.duration
-                logger.info(f"Voice audio duration: {video_duration:.2f} seconds")
-                
-                # Apply volume adjustment directly to the audio array
-                bg_music = bg_music.with_effects([MultiplyVolume(BG_MUSIC_VOLUME)])
+                final_audio, video_duration = process_audio(voice_path, bg_music_path)
             except Exception as e:
-                logging.error(f"Error loading audio file: {e}")
+                logging.error(f"Error processing audio: {e}")
                 raise
 
-            # --- Create Image Sequence Video ---
-            logger.info("Creating image sequence with Ken Burns effect...")
-            clips = []
-            current_time = 0
-            image_index = 0
-            
-            # Create clips for all images except the last one with fixed duration
-            while current_time < video_duration and image_index < len(image_paths) - 1:
-                img_path = image_paths[image_index]
-                clip_duration = min(IMAGE_DURATION_S, video_duration - current_time)
-                if clip_duration <= 0: break # Avoid zero duration clips
+            # 3. Create Image Sequence Video
+            logger.info("Creating image sequence...")
+            final_image_video = create_image_sequence(image_paths, video_duration, IMAGE_DURATION_S)
 
-                try:
-                    kb_clip = create_ken_burns_clip(img_path, clip_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
-                    kb_clip = kb_clip.with_start(current_time) # Not strictly needed for concatenation but good practice
-                    clips.append(kb_clip)
-                    logger.debug(f"Created clip for image {image_index}: start={current_time:.2f}, duration={clip_duration:.2f}")
-                except Exception as e:
-                    logger.error(f"Error creating Ken Burns clip for {img_path}: {e}. Skipping image.")
-                    # Add a blank clip or handle differently?
-                    # For now, just skip, might shorten video.
-
-                current_time += clip_duration
-                image_index += 1
-            
-            # Handle the last image - extend it to fill remaining duration
-            if image_index < len(image_paths) and current_time < video_duration:
-                last_img_path = image_paths[-1]
-                remaining_duration = video_duration - current_time
-                
-                try:
-                    last_clip = create_ken_burns_clip(last_img_path, remaining_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
-                    last_clip = last_clip.with_start(current_time)
-                    clips.append(last_clip)
-                    logger.debug(f"Created clip for last image: start={current_time:.2f}, duration={remaining_duration:.2f}")
-                except Exception as e:
-                    logger.error(f"Error creating Ken Burns clip for last image {last_img_path}: {e}")
-                    # Try to add a static image as fallback
-                    try:
-                        img = cv2.imread(last_img_path)
-                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        img = cv2.resize(img, (VIDEO_WIDTH, VIDEO_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
-                        static_clip = ImageClip(img, duration=remaining_duration).with_start(current_time)
-                        clips.append(static_clip)
-                    except Exception as inner_e:
-                        logger.error(f"Failed to create static clip for last image: {inner_e}")
-
-            if not clips:
-                 raise ValueError("Failed to create any video clips from images.")
-
-            final_image_video = concatenate_videoclips(clips).with_duration(video_duration)
-            logger.info(f"Concatenated image video duration: {final_image_video.duration:.2f} seconds")
-
-            # --- Create Text Overlays ---
+            # 4. Create Text Overlays
             logger.info("Creating text overlays...")
-            text_clips = []
-            for item in transcripts_list:
-                start_time = item.start
-                end_time = item.end
-                text_duration = end_time - start_time
-                if text_duration <= 0:
-                    logger.warning(f"Skipping transcript item with zero/negative duration: '{item.words}'")
-                    continue
+            text_clips = create_text_overlays_from_transcripts(transcripts_list)
 
-                # Create text clip
-                try:
-                    # Main text clip with transparent background
-                    txt_clip = TextClip(
-                        TEXT_FONT,  # Font path
-                        text=item.words,
-                        font_size=int(TEXT_FONT_SIZE),
-                        color=TEXT_COLOR,
-                        stroke_color=TEXT_STROKE_COLOR,
-                        stroke_width=int(TEXT_STROKE_WIDTH),
-                        size=(int(VIDEO_WIDTH * 0.9), None),
-                        method='caption',  # Auto-wrap text
-                        transparent=True  # Ensure transparency
-                    )
-                    
-                    # Create shadow clip with transparent background
-                    shadow_clip = TextClip(
-                        TEXT_FONT,
-                        text=item.words,
-                        font_size=int(TEXT_FONT_SIZE),
-                        color=TEXT_SHADOW_COLOR,
-                        size=(int(VIDEO_WIDTH * 0.9), None),
-                        method='caption',
-                        transparent=True
-                    )
-                    
-                    # Calculate position
-                    pos_x, pos_y = TEXT_POSITION
-                    clip_w, clip_h = txt_clip.size
-                    if pos_y == 'bottom':
-                         final_pos_y = int(VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM)
-                    elif pos_y == 'center':
-                         final_pos_y = int((VIDEO_HEIGHT - clip_h) / 2)
-                    else: # Assume top or numeric
-                         final_pos_y = int(pos_y) if isinstance(pos_y, (int, float)) else pos_y
-
-                    if pos_x == 'center':
-                         final_pos_x = int((VIDEO_WIDTH - clip_w) / 2)
-                    else: # Assume left/right or numeric
-                        final_pos_x = int(pos_x) if isinstance(pos_x, (int, float)) else pos_x
-
-                    # Position shadow with offset
-                    shadow_pos_x = final_pos_x + TEXT_SHADOW_OFFSET[0]
-                    shadow_pos_y = final_pos_y + TEXT_SHADOW_OFFSET[1]
-                    
-                    # Apply blur to shadow if needed
-                    if TEXT_SHADOW_BLUR > 0:
-                        # Instead of set_effects which might not be available, use a more compatible approach
-                        # to create a blurred text by resizing up and down
-                        try:
-                            # Get the shadow text as a numpy array
-                            shadow_array = shadow_clip.get_frame(0)
-                            
-                            # Apply a gaussian blur
-                            shadow_array = cv2.GaussianBlur(shadow_array, 
-                                                        (TEXT_SHADOW_BLUR*2+1, TEXT_SHADOW_BLUR*2+1), 
-                                                        TEXT_SHADOW_BLUR)
-                            
-                            # Create a new clip from the blurred array
-                            shadow_clip = ImageClip(shadow_array).with_duration(text_duration)
-                        except Exception as blur_error:
-                            logger.warning(f"Could not apply blur to shadow: {blur_error}")
-                            # Continue without blur effect
-                    
-                    # Set shadow position
-                    shadow_clip = shadow_clip.with_position((shadow_pos_x, shadow_pos_y))
-                    shadow_clip = shadow_clip.with_start(start_time)
-                    shadow_clip = shadow_clip.with_duration(text_duration)
-                    
-                    # Set text position
-                    txt_clip = txt_clip.with_position((final_pos_x, final_pos_y))
-                    txt_clip = txt_clip.with_start(start_time)
-                    txt_clip = txt_clip.with_duration(text_duration)
-                    
-                    # Add both clips
-                    text_clips.append(shadow_clip)
-                    text_clips.append(txt_clip)
-                    
-                    logger.debug(f"Created text clip with shadow: '{item.words}' start={start_time:.2f} end={end_time:.2f}")
-                except Exception as e:
-                    logger.error(f"Error creating text clip for '{item.words}': {e}")
-                    # Continue without this text clip rather than failing the entire process
-                    continue
-
-            # --- Combine Audio --- #
-            logger.info("Combining audio tracks...")
-            final_audio = CompositeAudioClip([voice_audio, bg_music])
-            # Ensure final audio has the exact duration
-            final_audio = final_audio.with_duration(video_duration)
-
-            # --- Composite Video --- #
+            # 5. Composite Video
             logger.info("Compositing final video...")
-            # Combine image sequence video with all text clips
             video_with_text = CompositeVideoClip([final_image_video] + text_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
             video_with_text = video_with_text.with_duration(video_duration)
-            # Set the combined audio to the final video
             final_clip = video_with_text.with_audio(final_audio)
 
-            # 4. Write Video File
-            logger.info(f"Writing final video to {output_video_path}...")
-            # Use appropriate codecs for web compatibility (H.264/AAC are common)
-            # threads=4 can speed up encoding, adjust based on Cloud Run CPU
-            # logger='bar' provides progress
-            final_clip.write_videofile(
-                output_video_path,
-                codec='libx264',
-                audio_codec='aac',
-                temp_audiofile=temp_audio_path, # Ensure temp file is in tmpdir
-                remove_temp=True,
-                fps=24,
-                bitrate="5000k",  # Higher bitrate for better quality
-                preset='medium', # 'medium' is a balance, 'fast' or 'ultrafast' for speed
-                threads=4,
-                logger='bar' # or None to disable progress bar logging
-            )
-            logger.info("Video file written successfully.")
+            # 6. Render Video
+            render_video(final_clip, output_video_path, temp_audio_path, quality='medium')
             
-            # Copy files to local output directory for development
+            # 7. Copy files to local output directory for development
             logger.info(f"Copying output video to local directory: {local_output_path}")
             shutil.copy2(output_video_path, local_output_path)
             
@@ -557,42 +524,212 @@ def process_video_task(request_data: VideoData):
                 shutil.copy2(bg_music_path, local_bg_music_path)
                 logger.info(f"Copied background music to: {local_bg_music_path}")
 
-            # 5. Upload Result
+            # 8. Upload Result
             logger.info(f"Uploading result: {output_video_path}")
             final_video_url = upload_to_gcs(output_video_path, OUTPUT_BUCKET_NAME, output_video_filename)
             logger.info(f"Video processing complete. Final URL: {final_video_url}")
-            # Consider adding success notification here
 
         except (HTTPException, ValueError, requests.exceptions.RequestException) as e:
             logger.error(f"Error during video processing task: {e}")
-            # Potentially log specific details or notify about failure
         except Exception as e:
             logger.exception(f"Unhandled exception during video processing task: {e}")
-            # Log the full traceback for unexpected errors
         finally:
-            # Cleanup moviepy's temporary files if any linger (though it usually cleans up)
-            # Close clips if necessary (moviepy usually handles this)
-            try:
-                if 'voice_audio' in locals() and voice_audio: voice_audio.close()
-                if 'bg_music' in locals() and bg_music: bg_music.close()
-                if 'final_image_video' in locals() and final_image_video: final_image_video.close()
-                if 'final_audio' in locals() and final_audio: final_audio.close()
-                if 'video_with_text' in locals() and video_with_text: video_with_text.close()
-                if 'final_clip' in locals() and final_clip: final_clip.close()
-                # Also close any text clips
-                if 'text_clips' in locals() and text_clips:
-                    for clip in text_clips:
-                        if clip: clip.close()
-            except Exception as e:
-                logger.warning(f"Error during clip cleanup: {e}")
+            # Clean up all clips
+            cleanup_clips(
+                final_audio if 'final_audio' in locals() else None,
+                final_image_video if 'final_image_video' in locals() else None,
+                video_with_text if 'video_with_text' in locals() else None,
+                final_clip if 'final_clip' in locals() else None,
+                text_clips if 'text_clips' in locals() else None
+            )
                 
             logger.info(f"Finished processing. Cleaned up temporary directory: {tmpdir}")
-            # Optional: Update a status in a DB or send notification about success/failure
             if final_video_url:
                 logger.info(f"Task succeeded. Video available at: {final_video_url}")
             else:
                 logger.error("Task failed to produce a video URL.")
 
+def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
+    """
+    Renders a video clip to a file with appropriate settings.
+    
+    Args:
+        final_clip: The MoviePy clip to render
+        output_path (str): Where to save the output video
+        temp_audio_path (str): Path for temporary audio file
+        quality (str): Rendering quality preset ('ultrafast', 'medium', 'high')
+        
+    Returns:
+        str: Path to the rendered video file
+    """
+    try:
+        # Set quality-dependent parameters
+        quality_presets = {
+            'ultrafast': {
+                'preset': 'ultrafast',
+                'bitrate': '3000k',
+                'threads': 4
+            },
+            'medium': {
+                'preset': 'medium',
+                'bitrate': '5000k',
+                'threads': 4
+            },
+            'high': {
+                'preset': 'slow',
+                'bitrate': '8000k',
+                'threads': 4
+            }
+        }
+        
+        preset = quality_presets.get(quality, quality_presets['medium'])
+        
+        logger.info(f"Rendering video to {output_path} with {quality} quality...")
+        final_clip.write_videofile(
+            output_path,
+            codec='libx264',
+            audio_codec='aac',
+            temp_audiofile=temp_audio_path,
+            remove_temp=True,
+            fps=24,
+            bitrate=preset['bitrate'],
+            preset=preset['preset'],
+            threads=preset['threads'],
+            logger='bar'
+        )
+        logger.info(f"Video successfully rendered to {output_path}")
+        return output_path
+    except Exception as e:
+        logger.error(f"Error rendering video: {e}")
+        raise
+
+def create_text_overlays_from_transcripts(transcripts, max_duration=None):
+    """
+    Creates text overlays from transcript items.
+    
+    Args:
+        transcripts (list): List of TranscriptItem objects
+        max_duration (float, optional): Maximum duration to include
+        
+    Returns:
+        list: List of text clips
+    """
+    text_clips = []
+    
+    # Filter transcripts if max_duration specified
+    filtered_transcripts = transcripts
+    if max_duration is not None:
+        filtered_transcripts = [
+            item for item in transcripts 
+            if item.start < max_duration
+        ]
+        
+        # For transcript items that extend beyond max_duration, cap their end time
+        for item in filtered_transcripts:
+            if item.end > max_duration:
+                item.end = max_duration
+    
+    logger.info(f"Creating text overlays for {len(filtered_transcripts)} transcript items")
+    
+    # Create text clips for each transcript item
+    for item in filtered_transcripts:
+        clips = create_text_clip(item.words, item.start, item.end)
+        text_clips.extend(clips)
+    
+    return text_clips
+
+def cleanup_clips(*clips_lists):
+    """
+    Safely close all clips to prevent memory leaks.
+    
+    Args:
+        *clips_lists: Variable number of clip lists or individual clips
+    """
+    for clips_or_clip in clips_lists:
+        if not clips_or_clip:
+            continue
+            
+        if isinstance(clips_or_clip, list):
+            for clip in clips_or_clip:
+                if clip:
+                    try:
+                        clip.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing clip: {e}")
+        else:
+            try:
+                clips_or_clip.close()
+            except Exception as e:
+                logger.warning(f"Error closing clip: {e}")
+
+def create_image_sequence(image_paths, total_duration, image_duration=IMAGE_DURATION_S):
+    """
+    Creates a sequence of image clips with Ken Burns effect.
+    
+    Args:
+        image_paths (list): List of image file paths
+        total_duration (float): Total video duration in seconds
+        image_duration (float, optional): Duration per image
+        
+    Returns:
+        moviepy.editor.VideoClip: Concatenated video clip of the image sequence
+    """
+    if not image_paths:
+        raise ValueError("No image paths provided")
+        
+    logger.info(f"Creating image sequence with {len(image_paths)} images for total duration of {total_duration:.2f}s")
+    
+    clips = []
+    current_time = 0
+    image_index = 0
+    
+    # Create clips for all images except the last one with fixed duration
+    while current_time < total_duration and image_index < len(image_paths) - 1:
+        img_path = image_paths[image_index]
+        clip_duration = min(image_duration, total_duration - current_time)
+        if clip_duration <= 0: 
+            break  # Avoid zero duration clips
+
+        try:
+            kb_clip = create_ken_burns_clip(img_path, clip_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
+            kb_clip = kb_clip.with_start(current_time)
+            clips.append(kb_clip)
+            logger.debug(f"Created clip for image {image_index}: start={current_time:.2f}, duration={clip_duration:.2f}")
+        except Exception as e:
+            logger.error(f"Error creating Ken Burns clip for {img_path}: {e}. Skipping image.")
+
+        current_time += clip_duration
+        image_index += 1
+    
+    # Handle the last image - extend it to fill remaining duration
+    if image_index < len(image_paths) and current_time < total_duration:
+        last_img_path = image_paths[-1]
+        remaining_duration = total_duration - current_time
+        
+        try:
+            last_clip = create_ken_burns_clip(last_img_path, remaining_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
+            last_clip = last_clip.with_start(current_time)
+            clips.append(last_clip)
+            logger.debug(f"Created clip for last image: start={current_time:.2f}, duration={remaining_duration:.2f}")
+        except Exception as e:
+            logger.error(f"Error creating Ken Burns clip for last image {last_img_path}: {e}")
+            # Try to add a static image as fallback
+            try:
+                img = cv2.imread(last_img_path)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (VIDEO_WIDTH, VIDEO_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
+                static_clip = ImageClip(img, duration=remaining_duration).with_start(current_time)
+                clips.append(static_clip)
+            except Exception as inner_e:
+                logger.error(f"Failed to create fallback static clip for last image: {inner_e}")
+
+    if not clips:
+        raise ValueError("Failed to create any video clips from images.")
+
+    final_video = concatenate_videoclips(clips).with_duration(total_duration)
+    logger.info(f"Created image sequence video with duration: {final_video.duration:.2f} seconds")
+    
+    return final_video
 
 # --- API Endpoint ---
 @app.post("/")
@@ -660,8 +797,6 @@ async def test_animation(request: AnimationTestRequest, image_count: int = Query
                     # Add more effect types here as they become available
                     # elif request.effect_type == "zoom":
                     #     animated_clip = create_zoom_clip(img_path, duration_per_image, (VIDEO_WIDTH, VIDEO_HEIGHT), **effect_params)
-                    # elif request.effect_type == "pan":
-                    #     animated_clip = create_pan_clip(img_path, duration_per_image, (VIDEO_WIDTH, VIDEO_HEIGHT), **effect_params)
                     else:
                         raise ValueError(f"Unsupported animation effect: {request.effect_type}")
                         
@@ -690,25 +825,11 @@ async def test_animation(request: AnimationTestRequest, image_count: int = Query
             final_video = concatenate_videoclips(clips).with_duration(total_duration)
             
             # Write video to file
-            logger.info(f"Writing video to {local_output_path}")
             temp_audio_path = os.path.join(tmpdir, 'temp-audio.m4a')
-            final_video.write_videofile(
-                local_output_path,
-                codec='libx264',
-                audio=False,  # No audio for this test
-                temp_audiofile=temp_audio_path,
-                remove_temp=True,
-                fps=24,
-                bitrate="5000k",  # Higher bitrate for better quality
-                preset='medium',
-                threads=4,
-                logger='bar'
-            )
+            render_video(final_video, local_output_path, temp_audio_path, quality='medium')
             
-            # Close clips
-            for clip in clips:
-                if clip: clip.close()
-            if final_video: final_video.close()
+            # Clean up resources
+            cleanup_clips(clips, final_video)
             
             logger.info(f"Animation test video created at {local_output_path}")
             return {
@@ -762,31 +883,11 @@ async def test_chunk_video(request: VideoRequest):
             else:
                 raise HTTPException(status_code=400, detail="No image URLs provided")
             
-            # Limit test chunk to 6 seconds
-            TEST_DURATION = 2.0  # 6 seconds for quick testing
+            # Limit test chunk to x seconds
+            TEST_DURATION = 2.0
             
-            
-            # Load voice audio and trim to test duration
-            voice_audio = AudioFileClip(voice_path).subclipped(0, TEST_DURATION)
-            test_duration = voice_audio.duration  # May be less than 6 if audio is shorter
-            
-            # Load and trim background music
-            bg_music = AudioFileClip(bg_music_path).subclipped(0, test_duration)
-            # Apply volume adjustment
-            bg_music = bg_music.with_effects([MultiplyVolume(BG_MUSIC_VOLUME)])
-            
-            # Filter transcripts to only include those in the test duration
-            filtered_transcripts = [
-                item for item in request.data.transcripts 
-                if item.start < test_duration
-            ]
-            
-            # For transcript items that extend beyond test_duration, cap their end time
-            for item in filtered_transcripts:
-                if item.end > test_duration:
-                    item.end = test_duration
-            
-            logger.info(f"Using {len(filtered_transcripts)} transcript items in test chunk")
+            # Process audio with limited duration
+            final_audio, test_duration = process_audio(voice_path, bg_music_path, TEST_DURATION)
             
             # Create Ken Burns clip for the first image
             logger.info("Creating Ken Burns effect for test image...")
@@ -794,103 +895,7 @@ async def test_chunk_video(request: VideoRequest):
             
             # Create text overlays for the filtered transcripts
             logger.info("Creating text overlays...")
-            text_clips = []
-            for item in filtered_transcripts:
-                start_time = item.start
-                end_time = item.end
-                text_duration = end_time - start_time
-                if text_duration <= 0:
-                    logger.warning(f"Skipping transcript item with zero/negative duration: '{item.words}'")
-                    continue
-
-                # Create text clip
-                try:
-                    # Main text clip with transparent background
-                    txt_clip = TextClip(
-                        TEXT_FONT,  # Font path
-                        text=item.words,
-                        font_size=int(TEXT_FONT_SIZE),
-                        color=TEXT_COLOR,
-                        stroke_color=TEXT_STROKE_COLOR,
-                        stroke_width=int(TEXT_STROKE_WIDTH),
-                        size=(int(VIDEO_WIDTH * 0.9), None),
-                        method='caption',  # Auto-wrap text
-                        transparent=True  # Ensure transparency
-                    )
-                    
-                    # Create shadow clip with transparent background
-                    shadow_clip = TextClip(
-                        TEXT_FONT,
-                        text=item.words,
-                        font_size=int(TEXT_FONT_SIZE),
-                        color=TEXT_SHADOW_COLOR,
-                        size=(int(VIDEO_WIDTH * 0.9), None),
-                        method='caption',
-                        transparent=True
-                    )
-                    
-                    # Calculate position
-                    pos_x, pos_y = TEXT_POSITION
-                    clip_w, clip_h = txt_clip.size
-                    if pos_y == 'bottom':
-                         final_pos_y = int(VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM)
-                    elif pos_y == 'center':
-                         final_pos_y = int((VIDEO_HEIGHT - clip_h) / 2)
-                    else: # Assume top or numeric
-                         final_pos_y = int(pos_y) if isinstance(pos_y, (int, float)) else pos_y
-
-                    if pos_x == 'center':
-                         final_pos_x = int((VIDEO_WIDTH - clip_w) / 2)
-                    else: # Assume left/right or numeric
-                        final_pos_x = int(pos_x) if isinstance(pos_x, (int, float)) else pos_x
-
-                    # Position shadow with offset
-                    shadow_pos_x = final_pos_x + TEXT_SHADOW_OFFSET[0]
-                    shadow_pos_y = final_pos_y + TEXT_SHADOW_OFFSET[1]
-                    
-                    # Apply blur to shadow if needed
-                    if TEXT_SHADOW_BLUR > 0:
-                        # Instead of set_effects which might not be available, use a more compatible approach
-                        # to create a blurred text by resizing up and down
-                        try:
-                            # Get the shadow text as a numpy array
-                            shadow_array = shadow_clip.get_frame(0)
-                            
-                            # Apply a gaussian blur
-                            shadow_array = cv2.GaussianBlur(shadow_array, 
-                                                        (TEXT_SHADOW_BLUR*2+1, TEXT_SHADOW_BLUR*2+1), 
-                                                        TEXT_SHADOW_BLUR)
-                            
-                            # Create a new clip from the blurred array
-                            shadow_clip = ImageClip(shadow_array).with_duration(text_duration)
-                        except Exception as blur_error:
-                            logger.warning(f"Could not apply blur to shadow: {blur_error}")
-                            # Continue without blur effect
-                    
-                    # Set shadow position
-                    shadow_clip = shadow_clip.with_position((shadow_pos_x, shadow_pos_y))
-                    shadow_clip = shadow_clip.with_start(start_time)
-                    shadow_clip = shadow_clip.with_duration(text_duration)
-                    
-                    # Set text position
-                    txt_clip = txt_clip.with_position((final_pos_x, final_pos_y))
-                    txt_clip = txt_clip.with_start(start_time)
-                    txt_clip = txt_clip.with_duration(text_duration)
-                    
-                    # Add both clips
-                    text_clips.append(shadow_clip)
-                    text_clips.append(txt_clip)
-                    
-                    logger.debug(f"Created text clip with shadow: '{item.words}' start={start_time:.2f} end={end_time:.2f}")
-                except Exception as e:
-                    logger.error(f"Error creating text clip for '{item.words}': {e}")
-                    # Continue without this text clip rather than failing the entire process
-                    continue
-            
-            # Combine audio tracks
-            logger.info("Combining audio for test chunk...")
-            final_audio = CompositeAudioClip([voice_audio, bg_music])
-            final_audio = final_audio.with_duration(test_duration)
+            text_clips = create_text_overlays_from_transcripts(request.data.transcripts, test_duration)
             
             # Composite video
             logger.info("Compositing final test video...")
@@ -898,39 +903,15 @@ async def test_chunk_video(request: VideoRequest):
             video_with_text = video_with_text.with_duration(test_duration)
             final_clip = video_with_text.with_audio(final_audio)
             
-            # Write video file with faster settings for quicker rendering
-            logger.info(f"Writing test chunk video to {output_video_path}...")
-            final_clip.write_videofile(
-                output_video_path,
-                codec='libx264',
-                audio_codec='aac',
-                temp_audiofile=temp_audio_path,
-                remove_temp=True,
-                fps=24,
-                bitrate="3000k",  # Lower bitrate for faster encoding
-                preset='ultrafast',  # Much faster encoding, lower quality is fine for test
-                threads=4,
-                logger='bar'
-            )
+            # Render with faster settings for quick preview
+            render_video(final_clip, output_video_path, temp_audio_path, quality='ultrafast')
             
             # Copy to output directory
             logger.info(f"Copying test chunk to {local_output_path}")
             shutil.copy2(output_video_path, local_output_path)
             
-            # Close clips
-            try:
-                if 'voice_audio' in locals() and voice_audio: voice_audio.close()
-                if 'bg_music' in locals() and bg_music: bg_music.close()
-                if 'kb_clip' in locals() and kb_clip: kb_clip.close()
-                if 'final_audio' in locals() and final_audio: final_audio.close()
-                if 'video_with_text' in locals() and video_with_text: video_with_text.close()
-                if 'final_clip' in locals() and final_clip: final_clip.close()
-                # Also close any text clips
-                if 'text_clips' in locals() and text_clips:
-                    for clip in text_clips:
-                        if clip: clip.close()
-            except Exception as e:
-                logger.warning(f"Error during clip cleanup: {e}")
+            # Clean up clips
+            cleanup_clips(final_audio, kb_clip, video_with_text, final_clip, text_clips)
             
             return {
                 "message": "Test chunk video created successfully",
