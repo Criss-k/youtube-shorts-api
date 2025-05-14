@@ -149,8 +149,6 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
             
         # Determine zoom and pan parameters
-        # Choose start and end points that ensure the entire target frame is filled
-        # For portrait (vertical) images, we need special handling
         is_portrait = img_aspect < target_aspect
         is_landscape = img_aspect > target_aspect
         
@@ -181,8 +179,6 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             zoom_start = zoom_end + zoom_range
         
         # Determine pan direction based on image aspect ratio
-        # For portrait images, favor vertical panning
-        # For landscape images, favor horizontal panning
         if is_portrait:
             pan_choices = [0, 3, 4]  # Center, top-to-bottom, bottom-to-top (weights vertical)
             weights = [0.2, 0.4, 0.4]  # Higher chance of vertical movement
@@ -196,68 +192,68 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
         # Select pan type with weighted random choice
         pan_type = random.choices(pan_choices, weights=weights, k=1)[0]
 
-        # Pre-generate frames to avoid compatibility issues with MoviePy's make_frame function
-        fps = 24
-        frame_count = int(duration * fps)
-        frames = []
+        # Higher fps for smoother animation
+        fps = 60
         
-        for i in range(frame_count):
-            t = i / fps
-            # Calculate progress with easing for more natural motion
-            progress = t / duration if duration > 0 else 0
-            # Smooth easing function (sine-based)
-            progress = 0.5 - 0.5 * math.cos(math.pi * progress)
-            
-            # Calculate current zoom level
-            current_zoom = zoom_start + (zoom_end - zoom_start) * progress
-            
-            # Calculate new dimensions with zoom
-            new_h = int(img_h * current_zoom)
-            new_w = int(img_w * current_zoom)
-            
-            # Resize using OpenCV with high-quality interpolation
-            resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-            
-            # Calculate crop position based on pan type and progress
-            if pan_type == 0:  # Center zoom
-                y = (new_h - target_h) // 2
-                x = (new_w - target_w) // 2
-            elif pan_type == 1:  # Left to right
-                y = (new_h - target_h) // 2
-                x = int((new_w - target_w) * progress)
-            elif pan_type == 2:  # Right to left
-                y = (new_h - target_h) // 2
-                x = int((new_w - target_w) * (1 - progress))
-            elif pan_type == 3:  # Top to bottom
-                x = (new_w - target_w) // 2
-                y = int((new_h - target_h) * progress)
-            else:  # Bottom to top (pan_type == 4)
-                x = (new_w - target_w) // 2
-                y = int((new_h - target_h) * (1 - progress))
-            
-            # Safety check - ensure we don't exceed image boundaries
-            x = min(max(0, x), new_w - target_w)
-            y = min(max(0, y), new_h - target_h)
-            
-            # Apply crop
-            cropped = resized[y:y+target_h, x:x+target_w]
-            frames.append(cropped)
-        
-        # Create the clip from pre-generated frames
-        clip = ImageClip(frames[0]).with_duration(duration)
+        # Create the clip with its initial frame
+        clip = ImageClip(img_array).with_duration(duration)
         clip.fps = fps
         
-        # Override the make_frame method to use our pre-generated frames
+        # Define a smooth frame generator function
         def get_frame(t):
-            frame_idx = min(int(t * fps), len(frames) - 1)
-            return frames[frame_idx]
+            # Normalize time to 0-1 range
+            progress = t / duration if duration > 0 else 0
+            
+            # Improved easing function for smoother motion
+            # Cubic easing function (smoother than sine)
+            progress = progress * progress * (3 - 2 * progress)
+            
+            # Calculate current zoom level with high precision
+            current_zoom = zoom_start + (zoom_end - zoom_start) * progress
+            
+            # Calculate new dimensions with zoom (maintain float precision)
+            new_h = img_h * current_zoom
+            new_w = img_w * current_zoom
+            
+            # Convert to int only when needed for resize operation
+            new_h_int, new_w_int = int(new_h), int(new_w)
+            
+            # Resize using high-quality interpolation
+            resized = cv2.resize(img_array, (new_w_int, new_h_int), interpolation=cv2.INTER_LANCZOS4)
+            
+            # Calculate crop position based on pan type and progress (maintain float precision)
+            if pan_type == 0:  # Center zoom
+                y_center = (new_h - target_h) / 2
+                x_center = (new_w - target_w) / 2
+                y = y_center
+                x = x_center
+            elif pan_type == 1:  # Left to right
+                y = (new_h - target_h) / 2
+                x = (new_w - target_w) * progress
+            elif pan_type == 2:  # Right to left
+                y = (new_h - target_h) / 2
+                x = (new_w - target_w) * (1 - progress)
+            elif pan_type == 3:  # Top to bottom
+                x = (new_w - target_w) / 2
+                y = (new_h - target_h) * progress
+            else:  # Bottom to top (pan_type == 4)
+                x = (new_w - target_w) / 2
+                y = (new_h - target_h) * (1 - progress)
+            
+            # Convert to int for cropping, ensuring we stay within bounds
+            x_int = max(0, min(int(x), new_w_int - target_w))
+            y_int = max(0, min(int(y), new_h_int - target_h))
+            
+            # Apply crop with precise boundaries
+            cropped = resized[y_int:y_int+target_h, x_int:x_int+target_w]
+            return cropped
             
         clip.get_frame = get_frame
         return clip
         
     except Exception as e:
         logger.error(f"Error creating Ken Burns clip for {image_path}: {e}")
-        # Better fallback handling for more resilience
+        # Fallback handling for more resilience
         try:
             # Load image with OpenCV 
             img = cv2.imread(image_path)
