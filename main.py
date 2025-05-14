@@ -7,11 +7,11 @@ import numpy as np
 from PIL import Image
 import math
 import shutil
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, HttpUrl, Field
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import requests
 from google.cloud import storage
 from moviepy import ImageClip, AudioFileClip, CompositeAudioClip, concatenate_videoclips, \
@@ -57,6 +57,16 @@ class VideoData(BaseModel):
 class VideoRequest(BaseModel):
     type: str = Field(..., pattern="^ImageVideo$") # Only allow "ImageVideo"
     data: VideoData
+
+class KenBurnsTestRequest(BaseModel):
+    image_urls: List[HttpUrl]
+    duration_per_image: Optional[float] = 6.0
+
+class AnimationTestRequest(BaseModel):
+    image_urls: List[HttpUrl]
+    duration_per_image: Optional[float] = 6.0
+    effect_type: str = "ken_burns"  # Default to ken_burns, will support more in the future
+    effect_params: Optional[dict] = None  # Optional parameters specific to each effect
 
 # --- FastAPI App ---
 app = FastAPI()
@@ -135,13 +145,12 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
         # 0: zoom center, 1: left to right, 2: right to left, 3: top to bottom, 4: bottom to top
         pan_type = random.randint(0, 4)
         
-        # For MoviePy 2.1.2, we'll use a simpler approach by creating frames in advance
-        # Create a sequence of frames for the Ken Burns effect
-        frames = []
-        num_frames = int(duration * 24)  # Assuming 24 fps
+        # For MoviePy 2.1.2, we'll use a closure to create the Ken Burns effect
+        fps = 24
         
-        for i in range(num_frames):
-            progress = i / (num_frames - 1) if num_frames > 1 else 0
+        def make_frame(t):
+            # Calculate progress based on time
+            progress = t / duration if duration > 0 else 0
             current_zoom = zoom_start + (zoom_end - zoom_start) * progress
             
             # Load and convert image
@@ -182,10 +191,10 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             if cropped.shape[2] == 4:  # If RGBA
                 cropped = cv2.cvtColor(cropped, cv2.COLOR_RGBA2RGB)
             
-            frames.append(cropped)
+            return cropped
         
-        # Create a VideoFileClip from frames
-        clip = ImageClip(frames[0], duration=duration)  # Start with first frame
+        # Create clip with make_frame function
+        clip = ImageClip(make_frame, duration=duration)
         return clip
     except Exception as e:
         logger.error(f"Error creating Ken Burns clip for {image_path}: {e}")
@@ -282,8 +291,10 @@ def process_video_task(request_data: VideoData):
             clips = []
             current_time = 0
             image_index = 0
-            while current_time < video_duration:
-                img_path = image_paths[image_index % len(image_paths)] # Loop images
+            
+            # Create clips for all images except the last one with fixed duration
+            while current_time < video_duration and image_index < len(image_paths) - 1:
+                img_path = image_paths[image_index]
                 clip_duration = min(IMAGE_DURATION_S, video_duration - current_time)
                 if clip_duration <= 0: break # Avoid zero duration clips
 
@@ -291,7 +302,7 @@ def process_video_task(request_data: VideoData):
                     kb_clip = create_ken_burns_clip(img_path, clip_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
                     kb_clip = kb_clip.with_start(current_time) # Not strictly needed for concatenation but good practice
                     clips.append(kb_clip)
-                    logger.debug(f"Created clip for image {image_index % len(image_paths)}: start={current_time:.2f}, duration={clip_duration:.2f}")
+                    logger.debug(f"Created clip for image {image_index}: start={current_time:.2f}, duration={clip_duration:.2f}")
                 except Exception as e:
                     logger.error(f"Error creating Ken Burns clip for {img_path}: {e}. Skipping image.")
                     # Add a blank clip or handle differently?
@@ -299,6 +310,28 @@ def process_video_task(request_data: VideoData):
 
                 current_time += clip_duration
                 image_index += 1
+            
+            # Handle the last image - extend it to fill remaining duration
+            if image_index < len(image_paths) and current_time < video_duration:
+                last_img_path = image_paths[-1]
+                remaining_duration = video_duration - current_time
+                
+                try:
+                    last_clip = create_ken_burns_clip(last_img_path, remaining_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
+                    last_clip = last_clip.with_start(current_time)
+                    clips.append(last_clip)
+                    logger.debug(f"Created clip for last image: start={current_time:.2f}, duration={remaining_duration:.2f}")
+                except Exception as e:
+                    logger.error(f"Error creating Ken Burns clip for last image {last_img_path}: {e}")
+                    # Try to add a static image as fallback
+                    try:
+                        img = cv2.imread(last_img_path)
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        img = cv2.resize(img, (VIDEO_WIDTH, VIDEO_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
+                        static_clip = ImageClip(img, duration=remaining_duration).with_start(current_time)
+                        clips.append(static_clip)
+                    except Exception as inner_e:
+                        logger.error(f"Failed to create static clip for last image: {inner_e}")
 
             if not clips:
                  raise ValueError("Failed to create any video clips from images.")
@@ -461,6 +494,113 @@ async def create_short_video(request: VideoRequest, background_tasks: Background
         # Although Pydantic validation catches this, adding belt-and-suspenders
         logger.warning(f"Received unsupported request type: {request.type}")
         raise HTTPException(status_code=400, detail=f"Unsupported type: {request.type}. Only 'ImageVideo' is supported.")
+
+@app.post("/test-animation")
+async def test_animation(request: AnimationTestRequest, image_count: int = Query(1, ge=1)):
+    """
+    Test endpoint to process images with various animation effects without audio.
+    
+    Args:
+        request: Contains image URLs, animation effect type, and parameters
+        image_count: Number of images to process (defaults to 1)
+    
+    Returns:
+        JSON with the path to the generated video file
+    """
+    logger.info(f"Received animation test request for {image_count} images with effect: {request.effect_type}")
+    
+    # Limit the number of images to process
+    image_urls = request.image_urls[:image_count]
+    if not image_urls:
+        raise HTTPException(status_code=400, detail="No image URLs provided")
+    
+    # Generate a unique filename
+    output_video_filename = f"{request.effect_type}_test_{os.urandom(8).hex()}.mp4"
+    
+    # Create local output directory if it doesn't exist
+    os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+    local_output_path = os.path.join(LOCAL_OUTPUT_DIR, output_video_filename)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            # Download images
+            logger.info("Downloading images...")
+            image_paths = [download_file(str(url), tmpdir) for url in image_urls]
+            
+            # Create clips with the requested animation effect
+            logger.info(f"Creating clips with {request.effect_type} effect...")
+            clips = []
+            duration_per_image = request.duration_per_image
+            effect_params = request.effect_params or {}
+            
+            for i, img_path in enumerate(image_paths):
+                try:
+                    # Apply the appropriate animation effect based on effect_type
+                    if request.effect_type == "ken_burns":
+                        animated_clip = create_ken_burns_clip(img_path, duration_per_image, (VIDEO_WIDTH, VIDEO_HEIGHT))
+                    # Add more effect types here as they become available
+                    # elif request.effect_type == "zoom":
+                    #     animated_clip = create_zoom_clip(img_path, duration_per_image, (VIDEO_WIDTH, VIDEO_HEIGHT), **effect_params)
+                    # elif request.effect_type == "pan":
+                    #     animated_clip = create_pan_clip(img_path, duration_per_image, (VIDEO_WIDTH, VIDEO_HEIGHT), **effect_params)
+                    else:
+                        raise ValueError(f"Unsupported animation effect: {request.effect_type}")
+                        
+                    animated_clip = animated_clip.with_start(i * duration_per_image)
+                    clips.append(animated_clip)
+                    logger.info(f"Created {request.effect_type} clip for image {i+1}")
+                except Exception as e:
+                    logger.error(f"Error creating animation clip for {img_path}: {e}")
+                    # Try a simpler static clip as fallback
+                    try:
+                        img = cv2.imread(img_path)
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        img = cv2.resize(img, (VIDEO_WIDTH, VIDEO_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
+                        static_clip = ImageClip(img, duration=duration_per_image).with_start(i * duration_per_image)
+                        clips.append(static_clip)
+                        logger.info(f"Created static clip for image {i+1} as fallback")
+                    except Exception as inner_e:
+                        logger.error(f"Failed to create fallback static clip: {inner_e}")
+            
+            if not clips:
+                raise HTTPException(status_code=500, detail="Failed to create any video clips from images")
+            
+            # Concatenate clips
+            logger.info("Concatenating clips...")
+            total_duration = len(clips) * duration_per_image
+            final_video = concatenate_videoclips(clips).with_duration(total_duration)
+            
+            # Write video to file
+            logger.info(f"Writing video to {local_output_path}")
+            temp_audio_path = os.path.join(tmpdir, 'temp-audio.m4a')
+            final_video.write_videofile(
+                local_output_path,
+                codec='libx264',
+                audio=False,  # No audio for this test
+                temp_audiofile=temp_audio_path,
+                remove_temp=True,
+                fps=24,
+                preset='medium',
+                threads=4,
+                logger='bar'
+            )
+            
+            # Close clips
+            for clip in clips:
+                if clip: clip.close()
+            if final_video: final_video.close()
+            
+            logger.info(f"Animation test video created at {local_output_path}")
+            return {
+                "message": f"{request.effect_type} animation test video created successfully", 
+                "video_path": local_output_path,
+                "effect_type": request.effect_type,
+                "duration": total_duration
+            }
+            
+        except Exception as e:
+            logger.exception(f"Error in animation test: {e}")
+            raise HTTPException(status_code=500, detail=f"Error processing animation test: {str(e)}")
 
 # --- Uvicorn Runner (for local testing) ---
 if __name__ == "__main__":
