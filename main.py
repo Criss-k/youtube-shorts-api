@@ -125,45 +125,100 @@ def upload_to_gcs(local_path: str, bucket_name: str, destination_blob_name: str)
         raise HTTPException(status_code=500, detail="Failed to upload final video to storage.")
 
 def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[int, int]) -> ImageClip:
-    """Creates a Ken Burns effect (pan/zoom) for an image clip."""
+    """
+    Creates a Ken Burns effect (pan/zoom) for an image clip.
+    
+    This implementation handles images of different aspect ratios by properly
+    preprocessing them and ensuring the Ken Burns effect works correctly regardless
+    of image orientation (portrait, landscape, or square).
+    """
     try:
+        target_w, target_h = target_size
+        target_aspect = target_w / target_h
+        
         # Load the image using PIL first to get dimensions
         pil_img = Image.open(image_path)
         img_w, img_h = pil_img.size
-        target_w, target_h = target_size
+        img_aspect = img_w / img_h
         
-        # Calculate scaling factors to fill the target size while maintaining aspect ratio
-        scale_w = target_w / img_w
-        scale_h = target_h / img_h
-        scale = max(scale_w, scale_h)
+        # Convert PIL image to numpy array
+        img_array = np.array(pil_img)
         
-        # Calculate initial and final zoom values
-        zoom_start = scale
-        zoom_end = scale * random.uniform(1.1, 1.3)  # Zoom in 10-30%
+        # Handle RGBA images
+        if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
+            
+        # Determine zoom and pan parameters
+        # Choose start and end points that ensure the entire target frame is filled
+        # For portrait (vertical) images, we need special handling
+        is_portrait = img_aspect < target_aspect
+        is_landscape = img_aspect > target_aspect
         
-        # Decide on pan direction (random)
-        # 0: zoom center, 1: left to right, 2: right to left, 3: top to bottom, 4: bottom to top
-        pan_type = random.randint(0, 4)
+        # Determine the minimum zoom required to fill the target frame
+        if is_portrait:  # Tall/narrow image
+            min_zoom = target_w / img_w  # Zoom to match width
+        else:  # Wide/landscape image
+            min_zoom = target_h / img_h  # Zoom to match height
         
-        # For MoviePy 2.1.2, we'll use a closure to create the Ken Burns effect
+        # Apply padding factor to ensure we can pan/zoom without showing borders
+        padding_factor = 1.1  # Add 10% padding
+        min_zoom *= padding_factor
+        
+        # Set zoom range - different for portrait vs landscape for better effect
+        if is_portrait:
+            zoom_range = random.uniform(0.1, 0.2)  # Less zoom for tall images
+        else:
+            zoom_range = random.uniform(0.2, 0.3)  # More zoom for wide images
+            
+        # Randomly decide whether to zoom in or zoom out
+        zoom_in = random.choice([True, False])
+        
+        if zoom_in:
+            zoom_start = min_zoom
+            zoom_end = zoom_start + zoom_range
+        else:
+            zoom_end = min_zoom
+            zoom_start = zoom_end + zoom_range
+        
+        # Determine pan direction based on image aspect ratio
+        # For portrait images, favor vertical panning
+        # For landscape images, favor horizontal panning
+        if is_portrait:
+            pan_choices = [0, 3, 4]  # Center, top-to-bottom, bottom-to-top (weights vertical)
+            weights = [0.2, 0.4, 0.4]  # Higher chance of vertical movement
+        elif is_landscape:
+            pan_choices = [0, 1, 2]  # Center, left-to-right, right-to-left (weights horizontal)
+            weights = [0.2, 0.4, 0.4]  # Higher chance of horizontal movement
+        else:  # Square or close to target aspect ratio
+            pan_choices = [0, 1, 2, 3, 4]  # All options
+            weights = [0.2, 0.2, 0.2, 0.2, 0.2]  # Equal chance
+            
+        # Select pan type with weighted random choice
+        pan_type = random.choices(pan_choices, weights=weights, k=1)[0]
+
+        # Pre-generate frames to avoid compatibility issues with MoviePy's make_frame function
         fps = 24
+        frame_count = int(duration * fps)
+        frames = []
         
-        def make_frame(t):
-            # Calculate progress based on time
+        for i in range(frame_count):
+            t = i / fps
+            # Calculate progress with easing for more natural motion
             progress = t / duration if duration > 0 else 0
+            # Smooth easing function (sine-based)
+            progress = 0.5 - 0.5 * math.cos(math.pi * progress)
+            
+            # Calculate current zoom level
             current_zoom = zoom_start + (zoom_end - zoom_start) * progress
             
-            # Load and convert image
-            img = np.array(pil_img)
-            
-            # Calculate new dimensions
+            # Calculate new dimensions with zoom
             new_h = int(img_h * current_zoom)
             new_w = int(img_w * current_zoom)
             
-            # Resize using OpenCV
-            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            # Resize using OpenCV with high-quality interpolation
+            resized = cv2.resize(img_array, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
             
-            # Calculate crop position based on pan type
+            # Calculate crop position based on pan type and progress
             if pan_type == 0:  # Center zoom
                 y = (new_h - target_h) // 2
                 x = (new_w - target_w) // 2
@@ -176,31 +231,35 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             elif pan_type == 3:  # Top to bottom
                 x = (new_w - target_w) // 2
                 y = int((new_h - target_h) * progress)
-            else:  # Bottom to top
+            else:  # Bottom to top (pan_type == 4)
                 x = (new_w - target_w) // 2
                 y = int((new_h - target_h) * (1 - progress))
             
-            # Ensure we don't go out of bounds
+            # Safety check - ensure we don't exceed image boundaries
             x = min(max(0, x), new_w - target_w)
             y = min(max(0, y), new_h - target_h)
             
-            # Crop to target size
+            # Apply crop
             cropped = resized[y:y+target_h, x:x+target_w]
-            
-            # Convert back to RGB if needed
-            if cropped.shape[2] == 4:  # If RGBA
-                cropped = cv2.cvtColor(cropped, cv2.COLOR_RGBA2RGB)
-            
-            return cropped
+            frames.append(cropped)
         
-        # Create clip with make_frame function
-        clip = ImageClip(make_frame, duration=duration)
+        # Create the clip from pre-generated frames
+        clip = ImageClip(frames[0]).with_duration(duration)
+        clip.fps = fps
+        
+        # Override the make_frame method to use our pre-generated frames
+        def get_frame(t):
+            frame_idx = min(int(t * fps), len(frames) - 1)
+            return frames[frame_idx]
+            
+        clip.get_frame = get_frame
         return clip
+        
     except Exception as e:
         logger.error(f"Error creating Ken Burns clip for {image_path}: {e}")
-        # Create a static clip as fallback
+        # Better fallback handling for more resilience
         try:
-            # Load image with OpenCV and resize
+            # Load image with OpenCV 
             img = cv2.imread(image_path)
             if img is None:
                 raise ValueError(f"Could not load image: {image_path}")
@@ -208,24 +267,37 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             # Convert BGR to RGB
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
-            # Calculate scaling to maintain aspect ratio
+            # Preserve aspect ratio while ensuring the image fills the frame
             h, w = img.shape[:2]
-            scale = max(target_size[0]/w, target_size[1]/h)
-            new_size = (int(w*scale), int(h*scale))
+            img_aspect = w / h
+            target_aspect = target_size[0] / target_size[1]
             
-            # Resize image
-            resized = cv2.resize(img, new_size, interpolation=cv2.INTER_LANCZOS4)
+            if img_aspect > target_aspect:  # Image is wider than target
+                # Scale to match height
+                new_h = target_size[1]
+                new_w = int(new_h * img_aspect)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+                
+                # Crop center to match target width
+                x_offset = (new_w - target_size[0]) // 2
+                img = img[:, x_offset:x_offset+target_size[0]]
+                
+            else:  # Image is taller than target
+                # Scale to match width
+                new_w = target_size[0]
+                new_h = int(new_w / img_aspect)
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+                
+                # Crop center to match target height
+                y_offset = (new_h - target_size[1]) // 2
+                img = img[y_offset:y_offset+target_size[1], :]
+                
+            # Create static clip with the properly sized image
+            return ImageClip(img, duration=duration)
             
-            # Center crop
-            y = (new_size[1] - target_size[1]) // 2
-            x = (new_size[0] - target_size[0]) // 2
-            cropped = resized[y:y+target_size[1], x:x+target_size[0]]
-            
-            # Create static clip directly with duration parameter
-            return ImageClip(cropped, duration=duration)
         except Exception as inner_e:
-            logger.error(f"Failed to create fallback static clip: {inner_e}")
-            # Create a blank clip as last resort
+            logger.error(f"Failed to create fallback static clip for {image_path}: {inner_e}")
+            # Last resort: create a blank clip
             blank = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
             return ImageClip(blank, duration=duration)
 
@@ -415,6 +487,7 @@ def process_video_task(request_data: VideoData):
                 temp_audiofile=temp_audio_path, # Ensure temp file is in tmpdir
                 remove_temp=True,
                 fps=24,
+                bitrate="5000k",  # Higher bitrate for better quality
                 preset='medium', # 'medium' is a balance, 'fast' or 'ultrafast' for speed
                 threads=4,
                 logger='bar' # or None to disable progress bar logging
@@ -580,6 +653,7 @@ async def test_animation(request: AnimationTestRequest, image_count: int = Query
                 temp_audiofile=temp_audio_path,
                 remove_temp=True,
                 fps=24,
+                bitrate="5000k",  # Higher bitrate for better quality
                 preset='medium',
                 threads=4,
                 logger='bar'
