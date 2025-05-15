@@ -17,7 +17,7 @@ from moviepy import ImageClip, AudioFileClip, CompositeAudioClip, concatenate_vi
 from moviepy.audio.fx import MultiplyVolume
 import cv2
 from datetime import datetime
-from proglog import ProgressBarLogger
+from proglog import ProgressBarLogger, TqdmProgressBarLogger
 
 # Set up minimal logging with timestamps
 logging.basicConfig(
@@ -667,8 +667,6 @@ class CustomProgressLogger(ProgressBarLogger):
     Example usage:
     
     ```python
-    from proglog import ProgressBarLogger
-    
     # Create the logger
     progress_logger = CustomProgressLogger()
     
@@ -689,7 +687,8 @@ class CustomProgressLogger(ProgressBarLogger):
     "MoviePy t:writing progress: 20%"
     ...and so on, at each 10% threshold.
     """
-    def __init__(self, init_state=None, bars=None, ignored_bars=None, logged_bars='all', min_time_interval=0, ignore_bars_under=0):
+    def __init__(self, init_state=None, bars=None, ignored_bars=None, logged_bars='all', 
+                 min_time_interval=0, ignore_bars_under=0, print_messages=True):
         """
         Initialize the logger with custom parameters.
         
@@ -700,9 +699,52 @@ class CustomProgressLogger(ProgressBarLogger):
             logged_bars (str or list, optional): Bar names to log ('all' for all bars).
             min_time_interval (float, optional): Minimum time between callbacks in seconds.
             ignore_bars_under (float, optional): Ignore bars with progress under this value.
+            print_messages (bool, optional): Whether to print message logs.
         """
         super().__init__(init_state, bars, ignored_bars, logged_bars, min_time_interval, ignore_bars_under)
         self.last_percentage = {}  # Track last logged percentage per bar
+        self.print_messages = print_messages
+    
+    def bars_callback(self, bar, attr, value, old_value=None):
+        """
+        Execute a custom action after the progress bars are updated.
+        This overrides the parent method to handle MoviePy's progress bars.
+        
+        Args:
+            bar: Name/ID of the bar to be modified
+            attr: Attribute of the bar attribute to be modified
+            value: New value of the attribute
+            old_value: Previous value of this bar's attribute
+        """
+        # Call the parent method first
+        super().bars_callback(bar, attr, value, old_value)
+        
+        # Only process when index and total are updated
+        if attr != 'index' or 'total' not in self.state.get('bars', {}).get(bar, {}):
+            return
+            
+        bar_state = self.state['bars'][bar]
+        total = bar_state.get('total', 0)
+        
+        if total <= 0:
+            return
+            
+        # Calculate current percentage
+        current_percentage = int((value / total) * 100)
+        
+        # Get last logged percentage for this bar (default to -10 to ensure first 0% is logged)
+        last_percentage = self.last_percentage.get(bar, -10)
+        
+        # Check if we've crossed a 10% threshold
+        if current_percentage // 10 > last_percentage // 10:
+            # Round down to nearest 10%
+            display_percentage = (current_percentage // 10) * 10
+            logger.info(f"MoviePy {bar} progress: {display_percentage}%")
+            self.last_percentage[bar] = current_percentage
+            
+            # Special case for 100% completion
+            if current_percentage >= 100 and last_percentage < 100:
+                logger.info(f"MoviePy {bar} completed: 100%")
     
     def callback(self, **changes):
         """
@@ -712,33 +754,35 @@ class CustomProgressLogger(ProgressBarLogger):
         Args:
             **changes: Dictionary of changes to the logger state.
         """
-        # Call parent callback first
+        # Handle messages if present
+        if self.print_messages and 'message' in changes:
+            logger.info(f"MoviePy: {changes['message']}")
+            
+        # Call parent callback
         super().callback(**changes)
         
-        # Extract bars info from state
-        for bar_name, bar_state in self.state.items():
-            if not isinstance(bar_state, dict) or not ('index' in bar_state and 'total' in bar_state):
-                continue
+        # Handle progress for non-bar items in the state
+        for key, value in changes.items():
+            if key != 'bars' and isinstance(value, dict) and 'index' in value and 'total' in value:
+                if value['total'] <= 0:
+                    continue
+                    
+                # Calculate current percentage
+                current_percentage = int((value['index'] / value['total']) * 100)
                 
-            if bar_state['total'] == 0:
-                continue
+                # Get last logged percentage for this process (default to -10 to ensure first 0% is logged)
+                last_percentage = self.last_percentage.get(key, -10)
                 
-            # Calculate current percentage
-            current_percentage = int((bar_state['index'] / bar_state['total']) * 100)
-            
-            # Get last logged percentage for this bar (default to -10 to ensure first 0% is logged)
-            last_percentage = self.last_percentage.get(bar_name, -10)
-            
-            # Check if we've crossed a 10% threshold
-            if current_percentage // 10 > last_percentage // 10:
-                # Round down to nearest 10%
-                display_percentage = (current_percentage // 10) * 10
-                logger.info(f"MoviePy {bar_name} progress: {display_percentage}%")
-                self.last_percentage[bar_name] = current_percentage
-                
-                # Special case for 100% completion
-                if current_percentage >= 100 and last_percentage < 100:
-                    logger.info(f"MoviePy {bar_name} completed: 100%")
+                # Check if we've crossed a 10% threshold
+                if current_percentage // 10 > last_percentage // 10:
+                    # Round down to nearest 10%
+                    display_percentage = (current_percentage // 10) * 10
+                    logger.info(f"MoviePy {key} progress: {display_percentage}%")
+                    self.last_percentage[key] = current_percentage
+                    
+                    # Special case for 100% completion
+                    if current_percentage >= 100 and last_percentage < 100:
+                        logger.info(f"MoviePy {key} completed: 100%")
 
 def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
     """
@@ -775,8 +819,8 @@ def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
         
         preset = quality_presets.get(quality, quality_presets['medium'])
         
-        # Create a custom progress logger instance
-        progress_logger = CustomProgressLogger()
+        # Create our custom progress logger
+        progress_logger = CustomProgressLogger(print_messages=True)
         
         logger.info(f"Rendering video to {output_path} with {quality} quality...")
         final_clip.write_videofile(
