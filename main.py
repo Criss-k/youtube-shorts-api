@@ -4,7 +4,7 @@ import tempfile
 import logging
 import random
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import math
 import shutil
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
@@ -18,6 +18,7 @@ from moviepy import ImageClip, AudioFileClip, CompositeAudioClip, concatenate_vi
                          TextClip, CompositeVideoClip, VideoFileClip
 from moviepy.audio.fx import MultiplyVolume
 import cv2
+from datetime import datetime
 
 # --- Configuration ---
 # Cloud Run dynamically sets the PORT environment variable.
@@ -39,13 +40,21 @@ TEXT_FONT_SIZE = 70 # Increased font size for better visibility
 TEXT_COLOR = 'white'
 TEXT_STROKE_COLOR = 'black'
 TEXT_STROKE_WIDTH = 5 # Increased for more visible stroke
+
 TEXT_POSITION = ('center', 'center') # Updated to center the text in the transparent area
 TEXT_MARGIN_BOTTOM = 120 # Increased to avoid watermark overlap
 
 # Shadow effect parameters
 TEXT_SHADOW_COLOR = 'black'
-TEXT_SHADOW_OFFSET = (5, 5) # Shadow offset in pixels (x, y)
-TEXT_SHADOW_BLUR = 3 # Shadow blur radius
+TEXT_SHADOW_OFFSET = (1, 1) # Shadow offset in pixels (x, y)
+TEXT_SHADOW_TYPE = 'radial' # Default shadow type: 'drop' or 'radial'
+TEXT_RADIAL_SHADOW_BLUR = 20 # Blur amount for radial shadow (higher values = more blur)
+
+TEXT_SHADOW_OPACITY = 0.8 # Opacity of the shadow (0.0 to 1.0, higher = darker)
+
+# Shadow layer count for thickness
+TEXT_SHADOW_LAYERS_DROP = 1 # Number of shadow layers for drop shadow
+TEXT_SHADOW_LAYERS_RADIAL = 5 # Number of shadow layers for radial shadow
 
 # --- Pydantic Models for Request Validation ---
 class TranscriptItem(BaseModel):
@@ -62,6 +71,7 @@ class VideoData(BaseModel):
 class VideoRequest(BaseModel):
     type: str = Field(..., pattern="^ImageVideo$") # Only allow "ImageVideo"
     data: VideoData
+    shadow_type: Optional[str] = None # Optional shadow type ('drop' or 'radial')
 
 class KenBurnsTestRequest(BaseModel):
     image_urls: List[HttpUrl]
@@ -302,18 +312,191 @@ def create_ken_burns_clip(image_path: str, duration: float, target_size: Tuple[i
             blank = np.zeros((target_size[1], target_size[0], 3), dtype=np.uint8)
             return ImageClip(blank, duration=duration)
 
-def create_text_clip(text, start_time, end_time):
+def create_drop_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, text_duration):
     """
-    Creates a text clip with shadow effect.
+    Creates a drop shadow effect for text using a separate TextClip with offset.
+    
+    Args:
+        txt_clip: The main text clip
+        text: The text content
+        final_pos_x: X position of the main text
+        final_pos_y: Y position of the main text
+        start_time: Start time of the clip
+        text_duration: Duration of the clip
+        
+    Returns:
+        TextClip: The shadow clip properly positioned and timed
+    """
+    # Create a separate shadow TextClip with the same parameters but black color
+    shadow_clip = TextClip(
+        TEXT_FONT,
+        text=text,
+        font_size=int(TEXT_FONT_SIZE),
+        color=TEXT_SHADOW_COLOR,
+        stroke_color='black',
+        stroke_width=int(TEXT_STROKE_WIDTH) + 2,  # Slightly thicker for shadow
+        size=(int(VIDEO_WIDTH * 0.9), None),
+        method='caption',
+        transparent=True
+    )
+    
+    # Position the shadow with a slight offset
+    shadow_offset_x, shadow_offset_y = TEXT_SHADOW_OFFSET
+    shadow_pos_x = final_pos_x + shadow_offset_x
+    shadow_pos_y = final_pos_y + shadow_offset_y
+    
+    # Set positions and timing
+    shadow_clip = shadow_clip.with_position((shadow_pos_x, shadow_pos_y))
+    shadow_clip = shadow_clip.with_start(start_time)
+    shadow_clip = shadow_clip.with_duration(text_duration)
+    
+    return shadow_clip
+
+def create_radial_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, text_duration):
+    """
+    Creates a radial shadow effect (glow) for text.
+    
+    Args:
+        txt_clip: The main text clip
+        text: The text content
+        final_pos_x: X position of the main text
+        final_pos_y: Y position of the main text
+        start_time: Start time of the clip
+        text_duration: Duration of the clip
+        
+    Returns:
+        TextClip: The radial shadow clip properly positioned and timed
+    """
+    # Calculate padding based on blur radius to ensure shadow has room to render
+    # Padding should be at least 2-3 times the blur radius
+    padding = max(int(TEXT_RADIAL_SHADOW_BLUR * 3), 100)
+    
+    # Create a large TextClip with the text in white on transparent background
+    # Use white text without stroke - will be used just for the mask
+    glow_base = TextClip(
+        TEXT_FONT,
+        text=text,
+        font_size=int(TEXT_FONT_SIZE),
+        color='white',  # White text for clear mask
+        stroke_color=None,
+        stroke_width=0,
+        size=(int(VIDEO_WIDTH * 0.9), None),
+        method='caption',
+        transparent=True
+    )
+    
+    # Get the original size of the text
+    orig_w, orig_h = glow_base.size
+    
+    # Create a larger canvas with padding on all sides
+    padded_w = orig_w + padding * 2
+    padded_h = orig_h + padding * 2
+    
+    # Create a blank padded canvas (transparent)
+    padded_canvas = np.zeros((padded_h, padded_w, 4), dtype=np.uint8)
+    
+    # Get the frame as numpy array (this should be RGBA)
+    text_frame = glow_base.get_frame(0)
+    
+    # Place the text in the center of the padded canvas
+    if text_frame.shape[2] == 4:  # RGBA
+        # Place the text frame in the middle of the padded canvas
+        y_offset = padding
+        x_offset = padding
+        padded_canvas[y_offset:y_offset+orig_h, x_offset:x_offset+orig_w] = text_frame
+        
+        # Extract the alpha channel for the mask
+        mask = padded_canvas[:, :, 3]
+    else:  # RGB
+        # Place the RGB frame in the middle of the padded canvas
+        y_offset = padding
+        x_offset = padding
+        padded_canvas[y_offset:y_offset+orig_h, x_offset:x_offset+orig_w, :3] = text_frame
+        
+        # If no alpha channel, use the luminance of the RGB image
+        # White text (255,255,255) will have high luminance values
+        mask = np.mean(padded_canvas[:, :, :3], axis=2).astype('uint8')
+    
+    # Convert to PIL Image for processing
+    mask_img = Image.fromarray(mask)
+    
+    # Apply gaussian blur to create the glow effect
+    # A higher radius creates a more spread-out glow
+    blurred_mask = mask_img.filter(
+        ImageFilter.GaussianBlur(radius=TEXT_RADIAL_SHADOW_BLUR)
+    )
+    
+    # Convert blurred mask back to numpy for processing
+    blurred_mask_array = np.array(blurred_mask)
+    
+    # Create RGBA array with shadow color and blurred mask as alpha
+    shadow_r, shadow_g, shadow_b = hex_to_rgb(TEXT_SHADOW_COLOR)
+    glow_array = np.zeros((padded_h, padded_w, 4), dtype=np.uint8)
+    glow_array[:, :, 0] = shadow_r  # R
+    glow_array[:, :, 1] = shadow_g  # G
+    glow_array[:, :, 2] = shadow_b  # B
+    
+    # Apply the opacity factor to the alpha channel
+    # Lower opacity (closer to 0) makes the shadow darker and more intense
+    # Higher opacity (closer to 1) makes the shadow lighter and more transparent
+    opacity_factor = max(0.1, min(1.0, TEXT_SHADOW_OPACITY))  # Clamp between 0.1 and 1.0
+    glow_array[:, :, 3] = (blurred_mask_array * opacity_factor).astype(np.uint8)
+    
+    # Create the final glow clip
+    glow_clip = ImageClip(glow_array).with_duration(text_duration)
+    
+    # Adjust position to account for the padding
+    # The text will remain in the same position, but the shadow extends beyond it
+    shadow_pos_x = final_pos_x - padding
+    shadow_pos_y = final_pos_y - padding
+    
+    glow_clip = glow_clip.with_position((shadow_pos_x, shadow_pos_y))
+    glow_clip = glow_clip.with_start(start_time)
+    
+    return glow_clip
+
+def hex_to_rgb(hex_color):
+    """Convert hex color to RGB tuple."""
+    # Handle both '#RRGGBB' and 'RRGGBB' formats
+    hex_color = hex_color.lstrip('#')
+    
+    # Handle named colors
+    if isinstance(hex_color, str) and not hex_color.startswith('#') and not all(c in '0123456789ABCDEFabcdef' for c in hex_color):
+        # For named colors like 'black', return appropriate RGB
+        color_map = {
+            'black': (0, 0, 0),
+            'white': (255, 255, 255),
+            'red': (255, 0, 0),
+            'green': (0, 255, 0),
+            'blue': (0, 0, 255),
+            'yellow': (255, 255, 0),
+            'cyan': (0, 255, 255),
+            'magenta': (255, 0, 255),
+            'transparent': (0, 0, 0, 0)
+        }
+        return color_map.get(hex_color.lower(), (0, 0, 0))
+    
+    # Convert hex to RGB
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def create_text_clip(text, start_time, end_time, shadow_type=None):
+    """
+    Creates a text clip with the specified shadow effect.
     
     Args:
         text (str): The text to display
         start_time (float): Start time in seconds
         end_time (float): End time in seconds
+        shadow_type (str, optional): Type of shadow effect: 'drop' or 'radial'.
+            If None, uses the default TEXT_SHADOW_TYPE
         
     Returns:
         list: List of clips (shadow and main text)
     """
+    # Use default shadow type if not specified
+    if shadow_type is None:
+        shadow_type = TEXT_SHADOW_TYPE
+        
     text_duration = end_time - start_time
     if text_duration <= 0:
         logger.warning(f"Skipping text clip with zero/negative duration: '{text}'")
@@ -321,7 +504,7 @@ def create_text_clip(text, start_time, end_time):
 
     clips = []
     try:
-        # Main text clip with transparent background
+        # Create the main text clip with transparent background
         txt_clip = TextClip(
             TEXT_FONT,  # Font path
             text=text,
@@ -334,68 +517,57 @@ def create_text_clip(text, start_time, end_time):
             transparent=True  # Ensure transparency
         )
         
-        # Create shadow clip with transparent background
-        shadow_clip = TextClip(
-            TEXT_FONT,
-            text=text,
-            font_size=int(TEXT_FONT_SIZE),
-            color=TEXT_SHADOW_COLOR,
-            size=(int(VIDEO_WIDTH * 0.9), None),
-            method='caption',
-            transparent=True
-        )
+        # Get the size of the text clip
+        clip_w, clip_h = txt_clip.size
         
         # Calculate position
         pos_x, pos_y = TEXT_POSITION
-        clip_w, clip_h = txt_clip.size
         if pos_y == 'bottom':
-             final_pos_y = int(VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM)
+            final_pos_y = int(VIDEO_HEIGHT - clip_h - TEXT_MARGIN_BOTTOM)
         elif pos_y == 'center':
-             final_pos_y = int((VIDEO_HEIGHT - clip_h) / 2)
-        else: # Assume top or numeric
-             final_pos_y = int(pos_y) if isinstance(pos_y, (int, float)) else pos_y
+            final_pos_y = int((VIDEO_HEIGHT - clip_h) / 2)
+        else:  # Assume top or numeric
+            final_pos_y = int(pos_y) if isinstance(pos_y, (int, float)) else pos_y
 
         if pos_x == 'center':
-             final_pos_x = int((VIDEO_WIDTH - clip_w) / 2)
-        else: # Assume left/right or numeric
+            final_pos_x = int((VIDEO_WIDTH - clip_w) / 2)
+        else:  # Assume left/right or numeric
             final_pos_x = int(pos_x) if isinstance(pos_x, (int, float)) else pos_x
-
-        # Position shadow with offset
-        shadow_pos_x = final_pos_x + TEXT_SHADOW_OFFSET[0]
-        shadow_pos_y = final_pos_y + TEXT_SHADOW_OFFSET[1]
         
-        # Apply blur to shadow if needed
-        if TEXT_SHADOW_BLUR > 0:
-            try:
-                # Get the shadow text as a numpy array
-                shadow_array = shadow_clip.get_frame(0)
+        # Create shadow effect based on selected type
+        if shadow_type == 'drop':
+            shadow_clip = create_drop_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, text_duration)
+            
+            # Add the drop shadow layer(s)
+            shadow_layers = TEXT_SHADOW_LAYERS_DROP
+            for _ in range(shadow_layers):
+                clips.append(shadow_clip)
                 
-                # Apply a gaussian blur
-                shadow_array = cv2.GaussianBlur(shadow_array, 
-                                            (TEXT_SHADOW_BLUR*2+1, TEXT_SHADOW_BLUR*2+1), 
-                                            TEXT_SHADOW_BLUR)
+        elif shadow_type == 'radial':
+            shadow_clip = create_radial_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, text_duration)
+            
+            # Add the radial shadow layer(s)
+            shadow_layers = TEXT_SHADOW_LAYERS_RADIAL
+            for _ in range(shadow_layers):
+                clips.append(shadow_clip)
                 
-                # Create a new clip from the blurred array
-                shadow_clip = ImageClip(shadow_array).with_duration(text_duration)
-            except Exception as blur_error:
-                logger.warning(f"Could not apply blur to shadow: {blur_error}")
-                # Continue without blur effect
+        else:
+            logger.warning(f"Unknown shadow type '{shadow_type}', falling back to drop shadow")
+            shadow_clip = create_drop_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, text_duration)
+            
+            # Add the default shadow layer
+            clips.append(shadow_clip)
         
-        # Set shadow position
-        shadow_clip = shadow_clip.with_position((shadow_pos_x, shadow_pos_y))
-        shadow_clip = shadow_clip.with_start(start_time)
-        shadow_clip = shadow_clip.with_duration(text_duration)
-        
-        # Set text position
+        # Set position and timing for the main text clip
         txt_clip = txt_clip.with_position((final_pos_x, final_pos_y))
         txt_clip = txt_clip.with_start(start_time)
         txt_clip = txt_clip.with_duration(text_duration)
         
-        # Add both clips
-        clips.append(shadow_clip)
+        # Add the text clip on top
         clips.append(txt_clip)
         
-        logger.debug(f"Created text clip with shadow: '{text}' start={start_time:.2f} end={end_time:.2f}")
+        shadow_type_str = shadow_type if shadow_type in ('drop', 'radial') else 'unknown'
+        logger.debug(f"Created text clip with {shadow_type_str} shadow: '{text}' start={start_time:.2f} end={end_time:.2f}")
     except Exception as e:
         logger.error(f"Error creating text clip for '{text}': {e}")
         # Continue without this text clip rather than failing the entire process
@@ -450,12 +622,13 @@ def process_audio(voice_path, bg_music_path, target_duration=None):
         logger.error(f"Error processing audio: {e}")
         raise
 
-def process_video_task(request_data: VideoData):
+def process_video_task(request_data: VideoData, shadow_type: Optional[str] = None):
     """
     Downloads assets, generates video using moviepy, uploads result.
     """
     logger.info("Starting video processing task...")
-    output_video_filename = f"output_{os.urandom(8).hex()}.mp4"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_video_filename = f"output_{timestamp}.mp4"
     final_video_url = None # Initialize
 
     # Create local output directory if it doesn't exist
@@ -496,7 +669,7 @@ def process_video_task(request_data: VideoData):
 
             # 4. Create Text Overlays
             logger.info("Creating text overlays...")
-            text_clips = create_text_overlays_from_transcripts(transcripts_list)
+            text_clips = create_text_overlays_from_transcripts(transcripts_list, max_duration=video_duration, shadow_type=shadow_type)
 
             # 5. Composite Video
             logger.info("Compositing final video...")
@@ -603,13 +776,15 @@ def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
         logger.error(f"Error rendering video: {e}")
         raise
 
-def create_text_overlays_from_transcripts(transcripts, max_duration=None):
+def create_text_overlays_from_transcripts(transcripts, max_duration=None, shadow_type=None):
     """
     Creates text overlays from transcript items.
     
     Args:
         transcripts (list): List of TranscriptItem objects
         max_duration (float, optional): Maximum duration to include
+        shadow_type (str, optional): Type of shadow to use ('drop' or 'radial').
+            If None, uses the default TEXT_SHADOW_TYPE
         
     Returns:
         list: List of text clips
@@ -629,11 +804,11 @@ def create_text_overlays_from_transcripts(transcripts, max_duration=None):
             if item.end > max_duration:
                 item.end = max_duration
     
-    logger.info(f"Creating text overlays for {len(filtered_transcripts)} transcript items")
+    logger.info(f"Creating text overlays for {len(filtered_transcripts)} transcript items with {shadow_type or TEXT_SHADOW_TYPE} shadow")
     
     # Create text clips for each transcript item
     for item in filtered_transcripts:
-        clips = create_text_clip(item.words, item.start, item.end)
+        clips = create_text_clip(item.words, item.start, item.end, shadow_type)
         text_clips.extend(clips)
     
     return text_clips
@@ -738,11 +913,14 @@ async def create_short_video(request: VideoRequest, background_tasks: Background
     API endpoint to trigger YouTube Shorts video generation.
     Accepts POST requests with asset URLs and transcript data.
     Initiates a background task for processing.
+    
+    Optional Parameters:
+        shadow_type: Type of shadow to use for text ('drop' or 'radial')
     """
-    logger.info(f"Received request for type: {request.type}")
+    logger.info(f"Received request for type: {request.type} with shadow_type: {request.shadow_type or TEXT_SHADOW_TYPE}")
     if request.type == "ImageVideo":
         # Add the processing to background tasks
-        background_tasks.add_task(process_video_task, request.data)
+        background_tasks.add_task(process_video_task, request.data, request.shadow_type)
         logger.info("Video generation task added to background.")
         # Return an immediate response acknowledging the request
         return {"message": "Video generation started successfully. Processing occurs in the background."}
@@ -771,7 +949,8 @@ async def test_animation(request: AnimationTestRequest, image_count: int = Query
         raise HTTPException(status_code=400, detail="No image URLs provided")
     
     # Generate a unique filename
-    output_video_filename = f"{request.effect_type}_test_{os.urandom(8).hex()}.mp4"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_video_filename = f"{request.effect_type}_test_{timestamp}.mp4"
     
     # Create local output directory if it doesn't exist
     os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
@@ -844,22 +1023,27 @@ async def test_animation(request: AnimationTestRequest, image_count: int = Query
             raise HTTPException(status_code=500, detail=f"Error processing animation test: {str(e)}")
 
 @app.post("/test-chunk")
-async def test_chunk_video(request: VideoRequest):
+async def test_chunk_video(request: VideoRequest, shadow_type: str = Query(None, description="Shadow type to use: 'drop' or 'radial'")):
     """
     API endpoint for rapid prototyping that generates a short 6-second video with:
     - Just the first image with Ken Burns effect
     - First 6 seconds of voice/audio
     - Captions that match that timeframe
     - Background music
+    - Optional shadow type for text
+    
+    Query Parameters:
+        shadow_type: Optional shadow type ('drop' or 'radial'). Uses default if not specified.
     
     Returns a path to the generated video for preview purposes.
     """
-    logger.info(f"Received test chunk request for type: {request.type}")
+    logger.info(f"Received test chunk request for type: {request.type} with shadow_type: {shadow_type or TEXT_SHADOW_TYPE}")
     if request.type != "ImageVideo":
         raise HTTPException(status_code=400, detail=f"Unsupported type: {request.type}. Only 'ImageVideo' is supported.")
     
     # Generate a unique filename
-    output_video_filename = f"test_chunk_{os.urandom(4).hex()}.mp4"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_video_filename = f"test_chunk_{timestamp}.mp4"
     
     # Create local output directory if it doesn't exist
     os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
@@ -894,8 +1078,8 @@ async def test_chunk_video(request: VideoRequest):
             kb_clip = create_ken_burns_clip(first_image_path, test_duration, (VIDEO_WIDTH, VIDEO_HEIGHT))
             
             # Create text overlays for the filtered transcripts
-            logger.info("Creating text overlays...")
-            text_clips = create_text_overlays_from_transcripts(request.data.transcripts, test_duration)
+            logger.info(f"Creating text overlays with {shadow_type or TEXT_SHADOW_TYPE} shadow...")
+            text_clips = create_text_overlays_from_transcripts(request.data.transcripts, test_duration, shadow_type)
             
             # Composite video
             logger.info("Compositing final test video...")
@@ -916,7 +1100,8 @@ async def test_chunk_video(request: VideoRequest):
             return {
                 "message": "Test chunk video created successfully",
                 "video_path": local_output_path,
-                "duration": test_duration
+                "duration": test_duration,
+                "shadow_type": shadow_type or TEXT_SHADOW_TYPE
             }
             
         except Exception as e:
