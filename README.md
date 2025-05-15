@@ -37,18 +37,18 @@ The service uses font files for text rendering. Make sure to include these files
 
 1. Build the Docker image:
    ```
-   docker build -t gcr.io/[YOUR-PROJECT-ID]/youtube-shorts-api .
+   docker build -t gcr.io/ascendant-timer-459011-g0/youtube-shorts-api .
    ```
 
 2. Push the image to Google Container Registry:
    ```
-   docker push gcr.io/[YOUR-PROJECT-ID]/youtube-shorts-api
+   docker push gcr.io/ascendant-timer-459011-g0/youtube-shorts-api
    ```
 
 3. Deploy to Cloud Run:
    ```
    gcloud run deploy youtube-shorts-api \
-     --image gcr.io/[YOUR-PROJECT-ID]/youtube-shorts-api \
+     --image gcr.io/ascendant-timer-459011-g0/youtube-shorts-api \
      --platform managed \
      --region [REGION] \
      --set-env-vars "OUTPUT_BUCKET_NAME=[YOUR-BUCKET-NAME]" \

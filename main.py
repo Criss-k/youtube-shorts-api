@@ -3,7 +3,7 @@ import tempfile
 import logging
 import random
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageFilter
 import shutil
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
@@ -17,6 +17,15 @@ from moviepy import ImageClip, AudioFileClip, CompositeAudioClip, concatenate_vi
 from moviepy.audio.fx import MultiplyVolume
 import cv2
 from datetime import datetime
+from proglog import ProgressBarLogger
+
+# Set up minimal logging with timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 # Try to load environment variables from .env file
 try:
@@ -33,9 +42,6 @@ except ImportError:
 PORT = int(os.environ.get("PORT", 8080))
 OUTPUT_BUCKET_NAME = os.environ.get("OUTPUT_BUCKET_NAME", "n8n-bucket-yt")  # Bucket to store final videos
 LOCAL_OUTPUT_DIR = "./output" # Local directory to save copies of output files
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # --- Constants ---
 VIDEO_WIDTH = 1080
@@ -649,6 +655,91 @@ def process_audio(voice_path, bg_music_path, target_duration=None):
         logger.error(f"Error processing audio: {e}")
         raise
 
+class CustomProgressLogger(ProgressBarLogger):
+    """
+    Custom progress logger for MoviePy that logs progress every 10%.
+    Based on the Proglog library (https://github.com/Edinburgh-Genome-Foundry/Proglog).
+    
+    This logger tracks the progress of various operations during video creation
+    and logs messages at 10% intervals to provide clearer progress updates
+    without overwhelming the logs.
+    
+    Example usage:
+    
+    ```python
+    from proglog import ProgressBarLogger
+    
+    # Create the logger
+    progress_logger = CustomProgressLogger()
+    
+    # Use with MoviePy
+    clip.write_videofile(
+        output_path,
+        codec='libx264',
+        audio_codec='aac',
+        logger=progress_logger  # Pass the logger here
+    )
+    
+    # Or update progress manually
+    progress_logger(my_process={"index": 5, "total": 10})  # 50% progress
+    ```
+    
+    This will log messages like:
+    "MoviePy t:writing progress: 10%" 
+    "MoviePy t:writing progress: 20%"
+    ...and so on, at each 10% threshold.
+    """
+    def __init__(self, init_state=None, bars=None, ignored_bars=None, logged_bars='all', min_time_interval=0, ignore_bars_under=0):
+        """
+        Initialize the logger with custom parameters.
+        
+        Args:
+            init_state (dict, optional): Initial state dictionary for the logger.
+            bars (list, optional): List of bar names to monitor.
+            ignored_bars (list, optional): Bar names to ignore.
+            logged_bars (str or list, optional): Bar names to log ('all' for all bars).
+            min_time_interval (float, optional): Minimum time between callbacks in seconds.
+            ignore_bars_under (float, optional): Ignore bars with progress under this value.
+        """
+        super().__init__(init_state, bars, ignored_bars, logged_bars, min_time_interval, ignore_bars_under)
+        self.last_percentage = {}  # Track last logged percentage per bar
+    
+    def callback(self, **changes):
+        """
+        Callback method that gets called when the logger state changes.
+        Log progress every 10% per bar.
+        
+        Args:
+            **changes: Dictionary of changes to the logger state.
+        """
+        # Call parent callback first
+        super().callback(**changes)
+        
+        # Extract bars info from state
+        for bar_name, bar_state in self.state.items():
+            if not isinstance(bar_state, dict) or not ('index' in bar_state and 'total' in bar_state):
+                continue
+                
+            if bar_state['total'] == 0:
+                continue
+                
+            # Calculate current percentage
+            current_percentage = int((bar_state['index'] / bar_state['total']) * 100)
+            
+            # Get last logged percentage for this bar (default to -10 to ensure first 0% is logged)
+            last_percentage = self.last_percentage.get(bar_name, -10)
+            
+            # Check if we've crossed a 10% threshold
+            if current_percentage // 10 > last_percentage // 10:
+                # Round down to nearest 10%
+                display_percentage = (current_percentage // 10) * 10
+                logger.info(f"MoviePy {bar_name} progress: {display_percentage}%")
+                self.last_percentage[bar_name] = current_percentage
+                
+                # Special case for 100% completion
+                if current_percentage >= 100 and last_percentage < 100:
+                    logger.info(f"MoviePy {bar_name} completed: 100%")
+
 def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
     """
     Renders a video clip to a file with appropriate settings.
@@ -684,6 +775,9 @@ def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
         
         preset = quality_presets.get(quality, quality_presets['medium'])
         
+        # Create a custom progress logger instance
+        progress_logger = CustomProgressLogger()
+        
         logger.info(f"Rendering video to {output_path} with {quality} quality...")
         final_clip.write_videofile(
             output_path,
@@ -695,7 +789,7 @@ def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
             bitrate=preset['bitrate'],
             preset=preset['preset'],
             threads=preset['threads'],
-            logger='bar'
+            logger=progress_logger
         )
         logger.info(f"Video successfully rendered to {output_path}")
         return output_path
@@ -781,9 +875,16 @@ def create_image_sequence(image_paths, total_duration, image_duration=IMAGE_DURA
         
     logger.info(f"Creating image sequence with {len(image_paths)} images for total duration of {total_duration:.2f}s")
     
+    # Create progress logger for image processing
+    progress_logger = CustomProgressLogger()
+    
     clips = []
     current_time = 0
     image_index = 0
+    total_images = len(image_paths)
+    
+    # Log initial progress
+    progress_logger(image_sequence={"index": 0, "total": total_images})
     
     # Create clips for all images except the last one with fixed duration
     while current_time < total_duration and image_index < len(image_paths) - 1:
@@ -802,6 +903,9 @@ def create_image_sequence(image_paths, total_duration, image_duration=IMAGE_DURA
 
         current_time += clip_duration
         image_index += 1
+        
+        # Update progress
+        progress_logger(image_sequence={"index": image_index, "total": total_images})
     
     # Handle the last image - extend it to fill remaining duration
     if image_index < len(image_paths) and current_time < total_duration:
@@ -824,6 +928,9 @@ def create_image_sequence(image_paths, total_duration, image_duration=IMAGE_DURA
                 clips.append(static_clip)
             except Exception as inner_e:
                 logger.error(f"Failed to create fallback static clip for last image: {inner_e}")
+                
+            # Final progress update
+            progress_logger(image_sequence={"index": total_images, "total": total_images})
 
     if not clips:
         raise ValueError("Failed to create any video clips from images.")
@@ -1141,5 +1248,32 @@ async def test_chunk_video(
 # --- Uvicorn Runner (for local testing) ---
 if __name__ == "__main__":
     import uvicorn
+    
     logger.info(f"Starting Uvicorn server locally on port {PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    
+    # Configure uvicorn with proper logging
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=PORT, 
+        log_config={
+            "version": 1,
+            "formatters": {
+                "default": {
+                    "fmt": log_format
+                }
+            },
+            "handlers": {
+                "default": {
+                    "formatter": "default",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stderr",
+                }
+            },
+            "loggers": {
+                "": {"handlers": ["default"], "level": "DEBUG"}
+            },
+        },
+        log_level="debug"
+    )

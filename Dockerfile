@@ -23,7 +23,7 @@ RUN mkdir -p fonts/Lexend/static && \
     echo "Note: Make sure to add your fonts to the fonts directory before building the image"
 
 # Expose the port
-EXPOSE 8081
+EXPOSE 8080
 
 # Run the FastAPI application with Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8081"] 
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"] 
