@@ -1,14 +1,12 @@
 import os
-import json
 import tempfile
 import logging
 import random
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-import math
 import shutil
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Tuple, Optional

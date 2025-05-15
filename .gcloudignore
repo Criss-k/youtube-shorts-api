@@ -1,0 +1,50 @@
+# Google Cloud SDK ignore file
+
+# Exclude git files
+.git
+.gitignore
+.github
+
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+env/
+venv/
+ENV/
+.venv/
+.pytest_cache/
+
+# Exclude output directory content
+output/*
+!output/.gitkeep
+
+# MacOS
+.DS_Store
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+
+# Docker files (not needed for direct gcloud deployments)
+Dockerfile
+.dockerignore
+
+# Local development files
+*.log
+.env.local
+
+# Credentials - IMPORTANT: never include these in deployments
+credentials/
+*.json
+*.pem
+*.key
+
+# This file
+.gcloudignore 

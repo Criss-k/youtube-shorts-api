@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+env/
+venv/
+ENV/
+.venv/
+.pytest_cache/
+
+# Output directory contents (but keep the directory itself)
+output/*
+!output/.gitkeep
+
+# MacOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursor/
+
+# Credentials (IMPORTANT: never include in Docker image)
+credentials/
+*.json
+*.pem
+*.key
+
+# Logs
+*.log 
