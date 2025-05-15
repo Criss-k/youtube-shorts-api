@@ -1251,29 +1251,8 @@ if __name__ == "__main__":
     
     logger.info(f"Starting Uvicorn server locally on port {PORT}")
     
-    # Configure uvicorn with proper logging
-    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=PORT, 
-        log_config={
-            "version": 1,
-            "formatters": {
-                "default": {
-                    "fmt": log_format
-                }
-            },
-            "handlers": {
-                "default": {
-                    "formatter": "default",
-                    "class": "logging.StreamHandler",
-                    "stream": "ext://sys.stderr",
-                }
-            },
-            "loggers": {
-                "": {"handlers": ["default"], "level": "DEBUG"}
-            },
-        },
-        log_level="debug"
+        port=PORT
     )
