@@ -46,15 +46,17 @@ TEXT_MARGIN_BOTTOM = 120 # Increased to avoid watermark overlap
 
 # Shadow effect parameters
 TEXT_SHADOW_COLOR = 'black'
-TEXT_SHADOW_OFFSET = (1, 1) # Shadow offset in pixels (x, y)
 TEXT_SHADOW_TYPE = 'radial' # Default shadow type: 'drop' or 'radial'
-TEXT_RADIAL_SHADOW_BLUR = 20 # Blur amount for radial shadow (higher values = more blur)
-
-TEXT_SHADOW_OPACITY = 0.8 # Opacity of the shadow (0.0 to 1.0, higher = darker)
-
-# Shadow layer count for thickness
 TEXT_SHADOW_LAYERS_DROP = 1 # Number of shadow layers for drop shadow
 TEXT_SHADOW_LAYERS_RADIAL = 5 # Number of shadow layers for radial shadow
+
+# Drop Shadow effect parameters
+TEXT_SHADOW_OFFSET = (1, 1) # Shadow offset in pixels (x, y)
+
+# Radial Shadow effect parameters
+TEXT_RADIAL_SHADOW_BLUR = 20 # Blur amount for radial shadow (higher values = more blur)
+TEXT_SHADOW_OPACITY = 0.8 # Opacity of the shadow (0.0 to 1.0, higher = darker)
+
 
 # --- Pydantic Models for Request Validation ---
 class TranscriptItem(BaseModel):
@@ -328,6 +330,7 @@ def create_drop_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, tex
         TextClip: The shadow clip properly positioned and timed
     """
     # Create a separate shadow TextClip with the same parameters but black color
+    stroke_padding = int(TEXT_STROKE_WIDTH)
     shadow_clip = TextClip(
         TEXT_FONT,
         text=text,
@@ -337,7 +340,8 @@ def create_drop_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, tex
         stroke_width=int(TEXT_STROKE_WIDTH) + 2,  # Slightly thicker for shadow
         size=(int(VIDEO_WIDTH * 0.9), None),
         method='caption',
-        transparent=True
+        transparent=True,
+        margin=(stroke_padding, stroke_padding)  # Add same padding as main text
     )
     
     # Position the shadow with a slight offset
@@ -371,6 +375,9 @@ def create_radial_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, t
     # Padding should be at least 2-3 times the blur radius
     padding = max(int(TEXT_RADIAL_SHADOW_BLUR * 3), 100)
     
+    # For text margin
+    stroke_padding = int(TEXT_STROKE_WIDTH)
+    
     # Create a large TextClip with the text in white on transparent background
     # Use white text without stroke - will be used just for the mask
     glow_base = TextClip(
@@ -382,7 +389,8 @@ def create_radial_shadow(txt_clip, text, final_pos_x, final_pos_y, start_time, t
         stroke_width=0,
         size=(int(VIDEO_WIDTH * 0.9), None),
         method='caption',
-        transparent=True
+        transparent=True,
+        margin=(stroke_padding, stroke_padding)  # Add same padding as main text
     )
     
     # Get the original size of the text
@@ -505,6 +513,7 @@ def create_text_clip(text, start_time, end_time, shadow_type=None):
     clips = []
     try:
         # Create the main text clip with transparent background
+        stroke_padding = int(TEXT_STROKE_WIDTH)
         txt_clip = TextClip(
             TEXT_FONT,  # Font path
             text=text,
@@ -514,7 +523,8 @@ def create_text_clip(text, start_time, end_time, shadow_type=None):
             stroke_width=int(TEXT_STROKE_WIDTH),
             size=(int(VIDEO_WIDTH * 0.9), None),
             method='caption',  # Auto-wrap text
-            transparent=True  # Ensure transparency
+            transparent=True,  # Ensure transparency
+            margin=(stroke_padding, stroke_padding)  # Add horizontal and vertical margin
         )
         
         # Get the size of the text clip
