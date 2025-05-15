@@ -651,106 +651,6 @@ def process_audio(voice_path, bg_music_path, target_duration=None):
         logger.error(f"Error processing audio: {e}")
         raise
 
-def process_video_task(request_data: VideoData, shadow_type: Optional[str] = None):
-    """
-    Downloads assets, generates video using moviepy, uploads result.
-    """
-    logger.info("Starting video processing task...")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_video_filename = f"output_{timestamp}.mp4"
-    final_video_url = None # Initialize
-
-    # Create local output directory if it doesn't exist
-    os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
-    local_output_path = os.path.join(LOCAL_OUTPUT_DIR, output_video_filename)
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        output_video_path = os.path.join(tmpdir, output_video_filename)
-        temp_audio_path = os.path.join(tmpdir, 'temp-audio.m4a')
-        try:
-            logger.info(f"Using temporary directory: {tmpdir}")
-
-            # 1. Download Assets
-            logger.info("Downloading assets...")
-            voice_path = download_file(str(request_data.voice_url), tmpdir)
-            bg_music_path = download_file(str(request_data.background_music_url), tmpdir)
-            image_paths = [download_file(str(url), tmpdir) for url in request_data.image_urls]
-
-            # Transcripts are now directly parsed Pydantic models
-            transcripts_list = request_data.transcripts # Directly use the parsed list
-            logger.info(f"Received {len(transcripts_list)} transcript items.")
-
-            # --- Basic Validation ---
-            if not image_paths:
-                raise ValueError("No image URLs provided or failed to download images.")
-
-            # 2. Process Audio
-            logging.info("Processing audio...")
-            try:
-                final_audio, video_duration = process_audio(voice_path, bg_music_path)
-            except Exception as e:
-                logging.error(f"Error processing audio: {e}")
-                raise
-
-            # 3. Create Image Sequence Video
-            logger.info("Creating image sequence...")
-            final_image_video = create_image_sequence(image_paths, video_duration, IMAGE_DURATION_S)
-
-            # 4. Create Text Overlays
-            logger.info("Creating text overlays...")
-            text_clips = create_text_overlays_from_transcripts(transcripts_list, max_duration=video_duration, shadow_type=shadow_type)
-
-            # 5. Composite Video
-            logger.info("Compositing final video...")
-            video_with_text = CompositeVideoClip([final_image_video] + text_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
-            video_with_text = video_with_text.with_duration(video_duration)
-            final_clip = video_with_text.with_audio(final_audio)
-
-            # 6. Render Video
-            render_video(final_clip, output_video_path, temp_audio_path, quality='medium')
-            
-            # 7. Copy files to local output directory for development
-            logger.info(f"Copying output video to local directory: {local_output_path}")
-            shutil.copy2(output_video_path, local_output_path)
-            
-            # Copy the audio file if it exists
-            if os.path.exists(voice_path):
-                voice_audio_filename = os.path.basename(voice_path)
-                local_voice_path = os.path.join(LOCAL_OUTPUT_DIR, voice_audio_filename)
-                shutil.copy2(voice_path, local_voice_path)
-                logger.info(f"Copied voice audio to: {local_voice_path}")
-            
-            if os.path.exists(bg_music_path):
-                bg_music_filename = os.path.basename(bg_music_path)
-                local_bg_music_path = os.path.join(LOCAL_OUTPUT_DIR, bg_music_filename)
-                shutil.copy2(bg_music_path, local_bg_music_path)
-                logger.info(f"Copied background music to: {local_bg_music_path}")
-
-            # 8. Upload Result
-            logger.info(f"Uploading result: {output_video_path}")
-            final_video_url = upload_to_gcs(output_video_path, OUTPUT_BUCKET_NAME, output_video_filename)
-            logger.info(f"Video processing complete. Final URL: {final_video_url}")
-
-        except (HTTPException, ValueError, requests.exceptions.RequestException) as e:
-            logger.error(f"Error during video processing task: {e}")
-        except Exception as e:
-            logger.exception(f"Unhandled exception during video processing task: {e}")
-        finally:
-            # Clean up all clips
-            cleanup_clips(
-                final_audio if 'final_audio' in locals() else None,
-                final_image_video if 'final_image_video' in locals() else None,
-                video_with_text if 'video_with_text' in locals() else None,
-                final_clip if 'final_clip' in locals() else None,
-                text_clips if 'text_clips' in locals() else None
-            )
-                
-            logger.info(f"Finished processing. Cleaned up temporary directory: {tmpdir}")
-            if final_video_url:
-                logger.info(f"Task succeeded. Video available at: {final_video_url}")
-            else:
-                logger.error("Task failed to produce a video URL.")
-
 def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
     """
     Renders a video clip to a file with appropriate settings.
@@ -937,22 +837,103 @@ def create_image_sequence(image_paths, total_duration, image_duration=IMAGE_DURA
 
 # --- API Endpoint ---
 @app.post("/")
-async def create_short_video(request: VideoRequest, background_tasks: BackgroundTasks):
+async def create_short_video(request: VideoRequest):
     """
     API endpoint to trigger YouTube Shorts video generation.
     Accepts POST requests with asset URLs and transcript data.
-    Initiates a background task for processing.
+    Processes the video synchronously and returns the result.
     
     Optional Parameters:
         shadow_type: Type of shadow to use for text ('drop' or 'radial')
+        
+    Returns:
+        JSON with the video URL and generation information
     """
     logger.info(f"Received request for type: {request.type} with shadow_type: {request.shadow_type or TEXT_SHADOW_TYPE}")
     if request.type == "ImageVideo":
-        # Add the processing to background tasks
-        background_tasks.add_task(process_video_task, request.data, request.shadow_type)
-        logger.info("Video generation task added to background.")
-        # Return an immediate response acknowledging the request
-        return {"message": "Video generation started successfully. Processing occurs in the background."}
+        # Process the video synchronously
+        try:
+            logger.info("Starting video generation synchronously...")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_video_filename = f"output_{timestamp}.mp4"
+            
+            # Create tempdir for processing
+            with tempfile.TemporaryDirectory() as tmpdir:
+                output_video_path = os.path.join(tmpdir, output_video_filename)
+                temp_audio_path = os.path.join(tmpdir, 'temp-audio.m4a')
+                
+                logger.info(f"Using temporary directory: {tmpdir}")
+
+                # 1. Download Assets
+                logger.info("Downloading assets...")
+                voice_path = download_file(str(request.data.voice_url), tmpdir)
+                bg_music_path = download_file(str(request.data.background_music_url), tmpdir)
+                image_paths = [download_file(str(url), tmpdir) for url in request.data.image_urls]
+
+                # Transcripts are now directly parsed Pydantic models
+                transcripts_list = request.data.transcripts
+                logger.info(f"Received {len(transcripts_list)} transcript items.")
+
+                # Basic Validation
+                if not image_paths:
+                    raise ValueError("No image URLs provided or failed to download images.")
+
+                # 2. Process Audio
+                logging.info("Processing audio...")
+                final_audio, video_duration = process_audio(voice_path, bg_music_path)
+
+                # 3. Create Image Sequence Video
+                logger.info("Creating image sequence...")
+                final_image_video = create_image_sequence(image_paths, video_duration, IMAGE_DURATION_S)
+
+                # 4. Create Text Overlays
+                logger.info("Creating text overlays...")
+                text_clips = create_text_overlays_from_transcripts(transcripts_list, max_duration=video_duration, shadow_type=request.shadow_type)
+
+                # 5. Composite Video
+                logger.info("Compositing final video...")
+                video_with_text = CompositeVideoClip([final_image_video] + text_clips, size=(VIDEO_WIDTH, VIDEO_HEIGHT))
+                video_with_text = video_with_text.with_duration(video_duration)
+                final_clip = video_with_text.with_audio(final_audio)
+
+                # 6. Render Video
+                render_video(final_clip, output_video_path, temp_audio_path, quality='medium')
+                
+                # Create local output directory if it doesn't exist
+                os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
+                local_output_path = os.path.join(LOCAL_OUTPUT_DIR, output_video_filename)
+                
+                # 7. Copy files to local output directory
+                logger.info(f"Copying output video to local directory: {local_output_path}")
+                shutil.copy2(output_video_path, local_output_path)
+                
+                # 8. Upload Result
+                logger.info(f"Uploading result: {output_video_path}")
+                final_video_url = upload_to_gcs(output_video_path, OUTPUT_BUCKET_NAME, output_video_filename)
+                logger.info(f"Video processing complete. Final URL: {final_video_url}")
+                
+                # Clean up all clips
+                cleanup_clips(
+                    final_audio if 'final_audio' in locals() else None,
+                    final_image_video if 'final_image_video' in locals() else None,
+                    video_with_text if 'video_with_text' in locals() else None,
+                    final_clip if 'final_clip' in locals() else None,
+                    text_clips if 'text_clips' in locals() else None
+                )
+                
+                # Return the success response with the video URL
+                return {
+                    "status": "success",
+                    "message": "Video generated successfully",
+                    "video_url": final_video_url,
+                    "local_path": local_output_path,
+                    "duration": video_duration,
+                    "timestamp": timestamp
+                }
+                
+        except Exception as e:
+            logger.exception(f"Error during video processing: {e}")
+            raise HTTPException(status_code=500, detail=f"Video generation failed: {str(e)}")
     else:
         # Although Pydantic validation catches this, adding belt-and-suspenders
         logger.warning(f"Received unsupported request type: {request.type}")
