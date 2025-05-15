@@ -13,11 +13,12 @@ from typing import List, Tuple, Optional
 import requests
 from google.cloud import storage
 from moviepy import ImageClip, AudioFileClip, CompositeAudioClip, concatenate_videoclips, \
-                         TextClip, CompositeVideoClip, VideoFileClip
+                         TextClip, CompositeVideoClip
 from moviepy.audio.fx import MultiplyVolume
 import cv2
 from datetime import datetime
-from proglog import ProgressBarLogger, TqdmProgressBarLogger
+from proglog import ProgressBarLogger
+import multiprocessing
 
 # Set up minimal logging with timestamps
 logging.basicConfig(
@@ -798,27 +799,29 @@ def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
         str: Path to the rendered video file
     """
     try:
+        # Use all available CPU cores
+        num_cores = multiprocessing.cpu_count()
+        logger.info(f"Using {num_cores} cores")
+
         # Set quality-dependent parameters
         quality_presets = {
             'ultrafast': {
                 'preset': 'ultrafast',
                 'bitrate': '3000k',
-                'threads': 4
             },
             'medium': {
                 'preset': 'medium',
                 'bitrate': '5000k',
-                'threads': 4
             },
             'high': {
                 'preset': 'slow',
                 'bitrate': '8000k',
-                'threads': 4
             }
         }
         
         preset = quality_presets.get(quality, quality_presets['medium'])
         
+
         # Create our custom progress logger
         progress_logger = CustomProgressLogger(print_messages=True)
         
@@ -832,7 +835,7 @@ def render_video(final_clip, output_path, temp_audio_path, quality='medium'):
             fps=24,
             bitrate=preset['bitrate'],
             preset=preset['preset'],
-            threads=preset['threads'],
+            threads=num_cores,
             logger=progress_logger
         )
         logger.info(f"Video successfully rendered to {output_path}")
