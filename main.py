@@ -20,10 +20,20 @@ from moviepy.audio.fx import MultiplyVolume
 import cv2
 from datetime import datetime
 
+# Try to load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load environment variables from .env file if it exists
+    load_dotenv()
+    logging.info("Loaded environment variables from .env file")
+except ImportError:
+    logging.warning("python-dotenv package not installed. Install with: pip install python-dotenv")
+    # Continue without loading .env file
+
 # --- Configuration ---
 # Cloud Run dynamically sets the PORT environment variable.
 PORT = int(os.environ.get("PORT", 8080))
-OUTPUT_BUCKET_NAME = "n8n-bucket-yt" # Bucket to store final videos
+OUTPUT_BUCKET_NAME = os.environ.get("OUTPUT_BUCKET_NAME", "n8n-bucket-yt")  # Bucket to store final videos
 LOCAL_OUTPUT_DIR = "./output" # Local directory to save copies of output files
 # Configure basic logging
 logging.basicConfig(level=logging.INFO)
@@ -126,7 +136,16 @@ def download_file(url: str, destination_folder: str) -> str:
 def upload_to_gcs(local_path: str, bucket_name: str, destination_blob_name: str) -> str:
     """Uploads a file to Google Cloud Storage and returns the public URL."""
     try:
-        storage_client = storage.Client()
+        # Check for explicit credentials file in environment variable first
+        credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        
+        if credentials_path and os.path.exists(credentials_path):
+            storage_client = storage.Client.from_service_account_json(credentials_path)
+            logger.info(f"Using GCS credentials from environment variable")
+        else:
+            # Fall back to default credentials
+            storage_client = storage.Client()
+            
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(destination_blob_name)
 
@@ -1033,7 +1052,11 @@ async def test_animation(request: AnimationTestRequest, image_count: int = Query
             raise HTTPException(status_code=500, detail=f"Error processing animation test: {str(e)}")
 
 @app.post("/test-chunk")
-async def test_chunk_video(request: VideoRequest, shadow_type: str = Query(None, description="Shadow type to use: 'drop' or 'radial'")):
+async def test_chunk_video(
+    request: VideoRequest, 
+    shadow_type: str = Query(None, description="Shadow type to use: 'drop' or 'radial'"),
+    should_upload_to_gcs: bool = Query(False, description="Whether to upload the output to Google Cloud Storage")
+):
     """
     API endpoint for rapid prototyping that generates a short 6-second video with:
     - Just the first image with Ken Burns effect
@@ -1044,10 +1067,11 @@ async def test_chunk_video(request: VideoRequest, shadow_type: str = Query(None,
     
     Query Parameters:
         shadow_type: Optional shadow type ('drop' or 'radial'). Uses default if not specified.
+        should_upload_to_gcs: If True, the output video will also be uploaded to Google Cloud Storage.
     
     Returns a path to the generated video for preview purposes.
     """
-    logger.info(f"Received test chunk request for type: {request.type} with shadow_type: {shadow_type or TEXT_SHADOW_TYPE}")
+    logger.info(f"Received test chunk request for type: {request.type} with shadow_type: {shadow_type or TEXT_SHADOW_TYPE}, upload_to_gcs: {should_upload_to_gcs}")
     if request.type != "ImageVideo":
         raise HTTPException(status_code=400, detail=f"Unsupported type: {request.type}. Only 'ImageVideo' is supported.")
     
@@ -1104,15 +1128,32 @@ async def test_chunk_video(request: VideoRequest, shadow_type: str = Query(None,
             logger.info(f"Copying test chunk to {local_output_path}")
             shutil.copy2(output_video_path, local_output_path)
             
+            # Upload to Google Cloud Storage if requested
+            gcs_url = None
+            if should_upload_to_gcs:
+                logger.info(f"Uploading test chunk to Google Cloud Storage...")
+                try:
+                    gcs_upload_result = upload_to_gcs(output_video_path, OUTPUT_BUCKET_NAME, output_video_filename)
+                    gcs_url = gcs_upload_result
+                    logger.info(f"Uploaded test chunk to GCS: {gcs_url}")
+                except Exception as upload_error:
+                    logger.error(f"Failed to upload to GCS: {upload_error}")
+                    # Continue execution even if upload fails
+            
             # Clean up clips
             cleanup_clips(final_audio, kb_clip, video_with_text, final_clip, text_clips)
             
-            return {
+            response = {
                 "message": "Test chunk video created successfully",
                 "video_path": local_output_path,
                 "duration": test_duration,
                 "shadow_type": shadow_type or TEXT_SHADOW_TYPE
             }
+            
+            if gcs_url:
+                response["gcs_url"] = gcs_url
+                
+            return response
             
         except Exception as e:
             logger.exception(f"Error in test chunk generation: {e}")

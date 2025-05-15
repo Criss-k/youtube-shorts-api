@@ -90,3 +90,18 @@ dmypy.json
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# Environment variables
+.env
+
+# Credentials
+credentials/
+*.json
+
+# Temp files
+*.mp4
+*.m4a
+*.wav
+*.aac
+tmp/
+temp/
