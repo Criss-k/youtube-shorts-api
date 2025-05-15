@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+# Set timezone to Riga (Latvia)
+ENV TZ=Europe/Riga
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 # Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
