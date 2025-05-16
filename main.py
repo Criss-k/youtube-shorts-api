@@ -80,6 +80,7 @@ class TranscriptItem(BaseModel):
     end: float
 
 class VideoData(BaseModel):
+    id: str  # Added id field
     background_music_url: HttpUrl
     image_urls: List[HttpUrl]
     voice_url: HttpUrl
@@ -1007,7 +1008,7 @@ async def create_short_video(request: VideoRequest):
         try:
             logger.info("Starting video generation synchronously...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_video_filename = f"output_{timestamp}.mp4"
+            output_video_filename = f"{request.data.id}_video_output.mp4"
             
             # Create tempdir for processing
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -1210,7 +1211,7 @@ async def test_chunk_video(
     
     # Generate a unique filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_video_filename = f"test_chunk_{timestamp}.mp4"
+    output_video_filename = f"{request.data.id}_test_chunk.mp4"
     
     # Create local output directory if it doesn't exist
     os.makedirs(LOCAL_OUTPUT_DIR, exist_ok=True)
